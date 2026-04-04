@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ns:order xmlns:ns="http://example.com/order">
+  <ns:item>Widget</ns:item>
+  <ns:quantity>100</ns:quantity>
+  <ns:price>9.99</ns:price>
+</ns:order>

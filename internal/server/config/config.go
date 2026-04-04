@@ -18,6 +18,7 @@ type Config struct {
 
 	// [sign]
 	SigntoolPath string
+	RawSignPath  string
 	CertPath     string
 	CSPName      string
 	CSPKey       string
@@ -55,6 +56,7 @@ func Load(path string) *Config {
 	// [sign]
 	signSec := f.Section("sign")
 	cfg.SigntoolPath = mustString(signSec, "signtool_path")
+	cfg.RawSignPath = signSec.Key("raw_sign_path").String() // 可选字段
 	cfg.CertPath = mustString(signSec, "cert_path")
 	cfg.CSPName = mustString(signSec, "csp_name")
 	cfg.CSPKey = mustString(signSec, "csp_key")

@@ -49,6 +49,14 @@ func CheckCert(path string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
+// CheckRawSign 验证 raw-sign.exe 是否存在
+func CheckRawSign(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("raw-sign.exe not found at %q: %w", path, err)
+	}
+	return nil
+}
+
 // CheckAll 执行所有启动前置检查，任何检查失败都记录 Fatal 并退出
 func CheckAll(cfg *config.Config) *x509.Certificate {
 	// 检查 signtool
@@ -72,6 +80,17 @@ func CheckAll(cfg *config.Config) *x509.Certificate {
 		"subject", cert.Subject.CommonName,
 		"expires", cert.NotAfter.Format("2006-01-02"),
 	)
+
+	// 检查 raw-sign.exe（可选）
+	if cfg.RawSignPath != "" {
+		slog.Info("checking raw-sign", "path", cfg.RawSignPath)
+		if err := CheckRawSign(cfg.RawSignPath); err != nil {
+			slog.Error("raw-sign check failed", "error", err)
+			fmt.Fprintf(os.Stderr, "FATAL: raw-sign check failed: %v\n", err)
+			os.Exit(1)
+		}
+		slog.Info("raw-sign OK")
+	}
 
 	return cert
 }

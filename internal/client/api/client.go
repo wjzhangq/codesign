@@ -176,6 +176,54 @@ func (c *Client) doWithRetry(req *http.Request, bodyBuf *bytes.Reader) (*http.Re
 	return c.httpClient.Do(req)
 }
 
+// RawSignResponse raw-sign 响应
+type RawSignResponse struct {
+	Signature string `json:"signature"`
+	Algorithm string `json:"algorithm"`
+}
+
+// RawSign 发送 raw-sign 请求
+func (c *Client) RawSign(digestHex, algo string) (*RawSignResponse, error) {
+	reqBody := map[string]string{
+		"digest":    digestHex,
+		"algorithm": algo,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", c.server+"/api/raw-sign", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.doWithRetry(req, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("raw-sign: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp map[string]any
+		json.NewDecoder(resp.Body).Decode(&errResp) //nolint:errcheck
+		msg, _ := errResp["error"].(string)
+		return nil, fmt.Errorf("raw-sign failed (%d): %s", resp.StatusCode, msg)
+	}
+
+	var result RawSignResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode raw-sign response: %w", err)
+	}
+	return &result, nil
+}
+
 // SignFull 上传完整文件进行全量签名（zstd 压缩）
 func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 	f, err := os.Open(filePath)

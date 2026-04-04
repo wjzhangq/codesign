@@ -92,6 +92,7 @@ func cmdServe(cfgPath string) {
 	mux.Handle("GET /api/cert", jwtMw(handler.CertHandler(cfg)))
 	mux.Handle("POST /api/sign", jwtMw(handler.SignDigestHandler(cfg, s)))
 	mux.Handle("POST /api/sign/full", jwtMw(handler.SignFullHandler(s)))
+	mux.Handle("POST /api/raw-sign", jwtMw(handler.RawSignHandler(s)))
 
 	slog.Info("starting codesign server",
 		"listen", cfg.Listen,

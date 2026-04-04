@@ -21,12 +21,21 @@ func HealthHandler(cfg *config.Config) http.HandlerFunc {
 			certExpires = cfg.CertExpires.Format("2006-01-02")
 		}
 
+		capabilities := []string{"pe-sign"}
+		if cfg.DigestMode {
+			capabilities = append(capabilities, "pe-digest")
+		}
+		if cfg.RawSignPath != "" {
+			capabilities = append(capabilities, "raw-sign", "xmldsig")
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":       "ok",
 			"mode":         mode,
 			"cert_subject": cfg.CertSubject,
 			"cert_expires": certExpires,
 			"time":         time.Now().UTC().Format(time.RFC3339),
+			"capabilities": capabilities,
 		})
 	}
 }
