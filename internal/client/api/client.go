@@ -1,0 +1,233 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+
+	"codesign/internal/pe"
+	"codesign/internal/server/handler"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// ErrFallbackRequired 表示服务端要求使用 Fallback 模式 (501)
+var ErrFallbackRequired = fmt.Errorf("digest mode not available, fallback required")
+
+// ErrUnauthorized 表示认证失败 (401)
+var ErrUnauthorized = fmt.Errorf("unauthorized: invalid or revoked token")
+
+// Client HTTP 客户端
+type Client struct {
+	server     string
+	token      string
+	httpClient *http.Client
+}
+
+// New 创建 API 客户端
+func New(server, token string) *Client {
+	return &Client{
+		server: server,
+		token:  token,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// HealthResponse /api/health 响应
+type HealthResponse struct {
+	Status      string `json:"status"`
+	Mode        string `json:"mode"`
+	CertSubject string `json:"cert_subject"`
+	CertExpires string `json:"cert_expires"`
+}
+
+// Health 检查服务端健康状态
+func (c *Client) Health() (*HealthResponse, error) {
+	resp, err := c.httpClient.Get(c.server + "/api/health")
+	if err != nil {
+		return nil, fmt.Errorf("health check: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result HealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode health response: %w", err)
+	}
+	return &result, nil
+}
+
+// GetPublicCert 获取服务端公钥证书 (DER 格式)
+func (c *Client) GetPublicCert() ([]byte, error) {
+	req, err := http.NewRequest("GET", c.server+"/api/cert", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get cert: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get cert: server returned %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// SignDigestRequest Digest 签名请求
+type SignDigestRequest struct {
+	Filename string              `json:"filename"`
+	Dig      string              `json:"dig"`
+	P7U      string              `json:"p7u"`
+	PEInfo   handler.PEInfoJSON  `json:"pe_info"`
+}
+
+// SignResponse 签名响应（两种模式共用）
+type SignResponse struct {
+	CertificateTable string `json:"certificate_table"`
+	Checksum         uint32 `json:"checksum"`
+	SecurityDirVA    uint32 `json:"security_dir_va"`
+	SecurityDirSize  uint32 `json:"security_dir_size"`
+}
+
+// SignDigest 发送 Digest 签名请求
+func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*SignResponse, error) {
+	reqBody := SignDigestRequest{
+		Filename: filename,
+		Dig:      digB64,
+		P7U:      p7uB64,
+		PEInfo: handler.PEInfoJSON{
+			ChecksumOffset:    info.ChecksumOffset,
+			SecurityDirOffset: info.SecurityDirOffset,
+			CertTableOffset:   info.CertTableOffset,
+			OverlayOffset:     info.OverlayOffset,
+			IsPE32Plus:        info.IsPE32Plus,
+		},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", c.server+"/api/sign", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sign digest: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode == http.StatusNotImplemented {
+		return nil, ErrFallbackRequired
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp map[string]any
+		json.NewDecoder(resp.Body).Decode(&errResp) //nolint:errcheck
+		msg, _ := errResp["error"].(string)
+		return nil, fmt.Errorf("sign digest failed (%d): %s", resp.StatusCode, msg)
+	}
+
+	var result SignResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode sign response: %w", err)
+	}
+	return &result, nil
+}
+
+// SignFull 上传完整文件进行全量签名（zstd 压缩）
+func (c *Client) SignFull(filePath string) (*SignResponse, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	// 使用 pipe 进行 zstd 流式压缩
+	pr, pw := io.Pipe()
+	go func() {
+		enc, err := zstd.NewWriter(pw)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(enc, f); err != nil {
+			enc.Close()
+			pw.CloseWithError(err)
+			return
+		}
+		enc.Close()
+		pw.Close()
+	}()
+
+	// 动态超时: 基础 60s + 每 10MB 增加 10s
+	timeoutSecs := 60 + int(stat.Size()/(10*1024*1024))*10
+	c.httpClient.Timeout = time.Duration(timeoutSecs) * time.Second
+	defer func() { c.httpClient.Timeout = 30 * time.Second }()
+
+	filename := filePath
+	if idx := len(filePath) - 1; idx >= 0 {
+		for i := len(filePath) - 1; i >= 0; i-- {
+			if filePath[i] == '/' || filePath[i] == '\\' {
+				filename = filePath[i+1:]
+				break
+			}
+		}
+	}
+
+	req, err := http.NewRequest("POST", c.server+"/api/sign/full", pr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("X-Filename", filename)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sign full: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp map[string]any
+		json.NewDecoder(resp.Body).Decode(&errResp) //nolint:errcheck
+		msg, _ := errResp["error"].(string)
+		return nil, fmt.Errorf("sign full failed (%d): %s", resp.StatusCode, msg)
+	}
+
+	var result SignResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode sign response: %w", err)
+	}
+	return &result, nil
+}
