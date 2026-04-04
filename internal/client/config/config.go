@@ -53,10 +53,12 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// MustLoad 加载配置，失败则返回空配置
+// MustLoad 加载配置，若文件不存在则返回空配置，若文件存在但解析失败则打印警告
 func MustLoad() *Config {
 	cfg, err := Load()
 	if err != nil {
+		// 使用 fmt.Fprintf 而非 log 以避免引入额外依赖
+		fmt.Fprintf(os.Stderr, "warning: failed to load config: %v\n", err)
 		return &Config{}
 	}
 	return cfg

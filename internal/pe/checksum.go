@@ -24,12 +24,9 @@ func ComputePEChecksum(r io.ReadSeeker, csOff uint32) uint32 {
 			i := 0
 			for ; i+1 < n; i += 2 {
 				cur := pos + uint32(i)
-				// 跳过 CheckSum 字段 (4 bytes at csOff)
-				if cur >= csOff && cur < csOff+4 {
-					continue
-				}
-				// 如果跨越 CheckSum 边界（奇数偏移情况），也跳过
-				if cur+1 >= csOff && cur < csOff+4 {
+				// 跳过任何与 CheckSum 字段（4 bytes at csOff）重叠的 16-bit word
+				// 条件: word 的右端 > csOff 且 word 的左端 < csOff+4
+				if cur+2 > csOff && cur < csOff+4 {
 					continue
 				}
 				word := uint64(binary.LittleEndian.Uint16(buf[i : i+2]))

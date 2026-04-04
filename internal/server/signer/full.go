@@ -12,6 +12,9 @@ import (
 	"codesign/internal/pe"
 )
 
+// maxDecompressedSize 限制解压后文件大小（防 zip bomb）：400 MB
+const maxDecompressedSize = 400 * 1024 * 1024
+
 // FullSignResult 全量签名结果
 type FullSignResult struct {
 	CertificateTable []byte
@@ -44,17 +47,19 @@ func (s *Signer) doFullSign(ctx context.Context, fileData io.Reader, filename st
 	safeName := sanitize(filename)
 	tmpFile := filepath.Join(tmpDir, safeName)
 
-	// 将文件写入临时目录
+	// 将文件写入临时目录，限制解压后大小（防 zip bomb）
 	f, err := os.Create(tmpFile)
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
 	}
-	if _, err := io.Copy(f, fileData); err != nil {
-		f.Close()
+	limited := io.LimitReader(fileData, maxDecompressedSize+1)
+	n, err := io.Copy(f, limited)
+	f.Close()
+	if err != nil {
 		return nil, fmt.Errorf("write temp file: %w", err)
 	}
-	if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("close temp file: %w", err)
+	if n > maxDecompressedSize {
+		return nil, fmt.Errorf("decompressed file exceeds maximum allowed size (%d MB)", maxDecompressedSize/(1024*1024))
 	}
 
 	// 构造 signtool sign 命令

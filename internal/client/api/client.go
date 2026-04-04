@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"codesign/internal/pe"
@@ -129,7 +131,8 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	// SignDigest 请求体为内存 buffer，可安全重试
+	resp, err := c.doWithRetry(req, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("sign digest: %w", err)
 	}
@@ -153,6 +156,24 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 		return nil, fmt.Errorf("decode sign response: %w", err)
 	}
 	return &result, nil
+}
+
+// doWithRetry 执行 HTTP 请求，在网络级错误时最多重试 1 次（Gap-4）
+// bodyBuf 是可重放的请求体（bytes.Reader 支持 Seek）
+func (c *Client) doWithRetry(req *http.Request, bodyBuf *bytes.Reader) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err == nil {
+		return resp, nil
+	}
+	// ctx 已取消/超时则不重试
+	if req.Context().Err() != nil {
+		return nil, err
+	}
+	// 重置请求体并等待短暂时间后重试
+	bodyBuf.Seek(0, io.SeekStart) //nolint:errcheck
+	req.Body = io.NopCloser(bodyBuf)
+	time.Sleep(500 * time.Millisecond)
+	return c.httpClient.Do(req)
 }
 
 // SignFull 上传完整文件进行全量签名（zstd 压缩）
@@ -186,21 +207,15 @@ func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 	}()
 
 	// 动态超时: 基础 60s + 每 10MB 增加 10s
+	// 使用 context 而非修改 httpClient.Timeout，以保证并发安全
 	timeoutSecs := 60 + int(stat.Size()/(10*1024*1024))*10
-	c.httpClient.Timeout = time.Duration(timeoutSecs) * time.Second
-	defer func() { c.httpClient.Timeout = 30 * time.Second }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
 
-	filename := filePath
-	if idx := len(filePath) - 1; idx >= 0 {
-		for i := len(filePath) - 1; i >= 0; i-- {
-			if filePath[i] == '/' || filePath[i] == '\\' {
-				filename = filePath[i+1:]
-				break
-			}
-		}
-	}
+	// 使用 filepath.Base 提取文件名，兼容所有平台路径分隔符
+	filename := filepath.Base(filePath)
 
-	req, err := http.NewRequest("POST", c.server+"/api/sign/full", pr)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign/full", pr)
 	if err != nil {
 		return nil, err
 	}

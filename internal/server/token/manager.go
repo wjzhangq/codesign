@@ -2,6 +2,7 @@ package token
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -17,6 +18,7 @@ type TokenInfo struct {
 	User      string    `json:"user"`
 	CreatedAt time.Time `json:"created_at"`
 	Revoked   bool      `json:"revoked"`
+	JTI       string    `json:"jti"` // 随机 token ID，用于使旧 token 失效
 }
 
 // tokenDB 持久化格式
@@ -27,7 +29,7 @@ type tokenDB struct {
 // Manager JWT token 管理器
 type Manager struct {
 	mu     sync.RWMutex
-	secret []byte
+	secret []byte // 只在 NewManager 中写入，此后只读，无需持锁访问
 	dbPath string
 	db     *tokenDB
 }
@@ -47,24 +49,34 @@ func NewManager(secret, dbPath string) (*Manager, error) {
 }
 
 // Create 为用户创建 token（永不过期）
+// 如果该用户已有 token，旧 token 会因 jti 不匹配而立即失效
 func (m *Manager) Create(user string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// 生成随机 jti（16 bytes = 128 bits 随机性）
+	jtiBytes := make([]byte, 16)
+	if _, err := rand.Read(jtiBytes); err != nil {
+		return "", fmt.Errorf("generate jti: %w", err)
+	}
+	jti := base64URLEncode(jtiBytes)
 
 	header := base64URLEncode([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload := base64URLEncode(mustJSON(map[string]any{
 		"sub": user,
 		"iat": time.Now().Unix(),
+		"jti": jti,
 	}))
 	msg := header + "." + payload
 	sig := base64URLEncode(hmacSHA256(m.secret, []byte(msg)))
 	token := msg + "." + sig
 
-	// 记录到数据库
+	// 记录到数据库（覆盖旧记录，旧 token 因 jti 不匹配而失效）
 	m.db.Users[user] = &TokenInfo{
 		User:      user,
 		CreatedAt: time.Now(),
 		Revoked:   false,
+		JTI:       jti,
 	}
 	if err := m.save(); err != nil {
 		return "", fmt.Errorf("save token db: %w", err)
@@ -99,8 +111,9 @@ func (m *Manager) Verify(token string) (string, error) {
 	if user == "" {
 		return "", fmt.Errorf("missing sub claim")
 	}
+	jti, _ := claims["jti"].(string)
 
-	// 检查 revoke 状态
+	// 检查 revoke 状态及 jti 匹配
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -110,6 +123,10 @@ func (m *Manager) Verify(token string) (string, error) {
 	}
 	if info.Revoked {
 		return "", fmt.Errorf("token for user %q has been revoked", user)
+	}
+	// 如果数据库中存储了 jti（新格式 token），验证其匹配
+	if info.JTI != "" && info.JTI != jti {
+		return "", fmt.Errorf("token for user %q has been superseded", user)
 	}
 
 	return user, nil

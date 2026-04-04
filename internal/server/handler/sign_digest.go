@@ -3,10 +3,13 @@ package handler
 import (
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"codesign/internal/pe"
 	"codesign/internal/server/config"
+	"codesign/internal/server/middleware"
 	"codesign/internal/server/signer"
 )
 
@@ -36,6 +39,9 @@ type SignDigestResponse struct {
 // SignDigestHandler 处理 Digest 模式签名请求
 func SignDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		user := middleware.UserFromContext(r.Context())
+
 		// 如果 Digest 模式未启用，返回 501
 		if !cfg.DigestMode {
 			writeJSON(w, http.StatusNotImplemented, map[string]any{
@@ -51,6 +57,11 @@ func SignDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc {
 		var req SignDigestRequest
 		dec := json.NewDecoder(r.Body)
 		if err := dec.Decode(&req); err != nil {
+			// Gap-1: MaxBytesReader 触发 → 413
+			if isBodyTooLarge(err) {
+				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 			return
 		}
@@ -80,9 +91,27 @@ func SignDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc {
 		// 调用 DigestSign
 		certTable, err := s.DigestSignFromBase64(r.Context(), req.Filename, req.Dig, req.P7U, peInfo)
 		if err != nil {
+			// M-6: 签名超时 → 503
+			if isTimeoutOrCanceled(err) || r.Context().Err() != nil {
+				slog.Info("sign/digest timeout",
+					"user", user, "file", req.Filename,
+					"duration_ms", time.Since(start).Milliseconds())
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"error": "signing queue timeout",
+				})
+				return
+			}
+			slog.Error("sign/digest failed",
+				"user", user, "file", req.Filename,
+				"error", err, "duration_ms", time.Since(start).Milliseconds())
 			writeError(w, http.StatusInternalServerError, "signing failed: "+err.Error())
 			return
 		}
+
+		// Gap-2: 审计日志
+		slog.Info("sign/digest ok",
+			"user", user, "file", req.Filename,
+			"duration_ms", time.Since(start).Milliseconds())
 
 		writeJSON(w, http.StatusOK, SignDigestResponse{
 			CertificateTable: base64.StdEncoding.EncodeToString(certTable),
@@ -90,5 +119,3 @@ func SignDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc {
 		})
 	}
 }
-
-

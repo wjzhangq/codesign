@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -67,11 +68,10 @@ func UserFromContext(ctx context.Context) string {
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write([]byte(`{"error":"` + escapeJSON(msg) + `"}`)) //nolint:errcheck
-}
-
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return s
+	// json.Marshal 对字符串的转义是完整的（含控制字符、换行符等）
+	escaped, err := json.Marshal(msg)
+	if err != nil {
+		escaped = []byte(`"internal error"`)
+	}
+	w.Write([]byte(`{"error":` + string(escaped) + `}`)) //nolint:errcheck
 }

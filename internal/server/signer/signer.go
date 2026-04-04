@@ -4,7 +4,6 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
-	"sync"
 
 	"codesign/internal/server/config"
 )
@@ -13,28 +12,40 @@ var safeFilename = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
 // Signer 封装 signtool 调用，保证 eToken 硬件签名串行执行
 type Signer struct {
-	cfg *config.Config
-	mu  sync.Mutex // eToken 硬件签名只能串行
+	cfg    *config.Config
+	lockCh chan struct{} // 用于 ctx 感知的锁等待（容量 1 的 channel 充当互斥锁）
 }
 
 // New 创建 Signer
 func New(cfg *config.Config) *Signer {
-	return &Signer{cfg: cfg}
+	s := &Signer{
+		cfg:    cfg,
+		lockCh: make(chan struct{}, 1),
+	}
+	// 初始时槽位可用（表示锁未被持有）
+	s.lockCh <- struct{}{}
+	return s
 }
 
-// withLock 在互斥锁保护下执行 fn，先检查 ctx 是否超时
+// withLock 在互斥锁保护下执行 fn，等待期间响应 ctx 取消
 func (s *Signer) withLock(ctx context.Context, fn func() error) error {
-	// 检查 ctx 是否已超时
+	// 先检查 ctx 是否已超时
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 使用 channel 实现可取消的锁等待
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.lockCh:
+		// 获取令牌（相当于持有锁）
+	}
+	defer func() { s.lockCh <- struct{}{} }() // 释放令牌
 
-	// 锁获取后再次检查 ctx
+	// 锁已获取，再次检查 ctx
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

@@ -15,14 +15,11 @@ import (
 func CheckSigntool(path string) error {
 	cmd := exec.Command(path, "/?")
 	if err := cmd.Run(); err != nil {
-		// signtool /? 返回非 0 但仍说明可用
+		// signtool /? 在某些版本返回 exit code 1（帮助文本输出后退出）
+		// 只接受 exit code 0 或 1 作为"工具存在且可执行"的凭证
 		exitErr, ok := err.(*exec.ExitError)
-		if ok && exitErr.ExitCode() == 0 {
+		if ok && (exitErr.ExitCode() == 0 || exitErr.ExitCode() == 1) {
 			return nil
-		}
-		// 只要能找到文件并执行就算成功（/? 通常返回 0 或 1）
-		if ok {
-			return nil // signtool found and executed
 		}
 		return fmt.Errorf("signtool not found or not executable at %q: %w", path, err)
 	}

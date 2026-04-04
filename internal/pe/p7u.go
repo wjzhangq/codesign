@@ -1,6 +1,7 @@
 package pe
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/binary"
@@ -163,10 +164,10 @@ func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error
 		return nil, err
 	}
 
-	// 3. MessageDigest = SHA-256(indirectData)
-	// 注意: 这里的 messageDigest 是对 indirectData content (inner content) 的 hash
-	// 在 unsigned PKCS#7 中，签名值为空
-	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: make([]byte, 32)})
+	// 3. MessageDigest = SHA-256(indirectData DER)
+	// signtool /ds 验证此值，必须与 indirectData 内容的 hash 匹配
+	msgDigestBytes := sha256.Sum256(indirectData)
+	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: msgDigestBytes[:]})
 	if err != nil {
 		return nil, err
 	}
