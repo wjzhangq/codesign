@@ -24,8 +24,8 @@ func SignCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "mode",
-				Usage: "Signing mode: auto, digest, full (default: auto)",
-				Value: "auto",
+				Usage: "Signing mode: auto, digest, full (default: full)",
+				Value: "full",
 			},
 			&cli.StringFlag{
 				Name:  "server",

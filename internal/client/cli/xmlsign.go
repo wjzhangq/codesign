@@ -13,6 +13,65 @@ import (
 	urfavecli "github.com/urfave/cli/v2"
 )
 
+// XmlVerifyCommand 返回 xmlverify 命令定义
+func XmlVerifyCommand() *urfavecli.Command {
+	return &urfavecli.Command{
+		Name:      "xmlverify",
+		Usage:     "Verify XMLDSIG enveloped signature in signed XML documents",
+		ArgsUsage: "<file> [file...]",
+		Action: func(c *urfavecli.Context) error {
+			if c.NArg() == 0 {
+				return urfavecli.ShowCommandHelp(c, "xmlverify")
+			}
+
+			files := c.Args().Slice()
+			hasError := false
+			for _, filePath := range files {
+				ok := xmlVerifyFile(filePath)
+				if !ok {
+					hasError = true
+				}
+			}
+			if hasError {
+				return fmt.Errorf("some files failed verification")
+			}
+			return nil
+		},
+	}
+}
+
+// xmlVerifyFile 验证单个 XML 文件的签名，返回 true 表示验证通过
+func xmlVerifyFile(filePath string) bool {
+	fmt.Printf("\n  %s\n", filepath.Base(filePath))
+
+	xmlBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Printf("  ERROR: read file: %v\n", err)
+		return false
+	}
+
+	result, err := xmldsig.VerifyXML(xmlBytes)
+	if err != nil {
+		fmt.Printf("  INVALID: %v\n", err)
+		return false
+	}
+
+	if !result.Valid {
+		fmt.Printf("  INVALID: signature verification failed\n")
+		return false
+	}
+
+	fmt.Printf("  VALID\n")
+	if result.SubjectCN != "" {
+		fmt.Printf("  Signer  : %s\n", result.SubjectCN)
+	}
+	if result.Certificate != nil {
+		fmt.Printf("  Issuer  : %s\n", result.Certificate.Issuer.CommonName)
+		fmt.Printf("  Valid   : %s → %s\n", result.NotBefore, result.NotAfter)
+	}
+	return true
+}
+
 // XmlSignCommand 返回 xmlsign 命令定义
 func XmlSignCommand() *urfavecli.Command {
 	return &urfavecli.Command{

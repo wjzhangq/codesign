@@ -19,6 +19,7 @@ func main() {
 			cli.ConfigCommand(),
 			cli.InfoCommand(),
 			cli.XmlSignCommand(),
+			cli.XmlVerifyCommand(),
 			cli.RawSignCommand(),
 		},
 		ExitErrHandler: func(c *urfavecli.Context, err error) {
