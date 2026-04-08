@@ -36,7 +36,8 @@ func New(server, token string) *Client {
 		server: server,
 		token:  token,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			// 不设全局 Timeout，由各请求通过 context 单独控制超时。
+			// 全局 Timeout 会导致大文件上传（SignFull）被提前截断。
 		},
 	}
 }
@@ -49,9 +50,18 @@ type HealthResponse struct {
 	CertExpires string `json:"cert_expires"`
 }
 
+// defaultTimeout 轻量请求的默认超时
+const defaultTimeout = 30 * time.Second
+
 // Health 检查服务端健康状态
 func (c *Client) Health() (*HealthResponse, error) {
-	resp, err := c.httpClient.Get(c.server + "/api/health")
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", c.server+"/api/health", nil)
+	if err != nil {
+		return nil, fmt.Errorf("health check: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("health check: %w", err)
 	}
@@ -66,7 +76,9 @@ func (c *Client) Health() (*HealthResponse, error) {
 
 // GetPublicCert 获取服务端公钥证书 (DER 格式)
 func (c *Client) GetPublicCert() ([]byte, error) {
-	req, err := http.NewRequest("GET", c.server+"/api/cert", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", c.server+"/api/cert", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +144,7 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 	req.Header.Set("Content-Type", "application/json")
 
 	// SignDigest 请求体为内存 buffer，可安全重试
+	// 超时由 doWithRetry 内部 defaultTimeout 控制
 	resp, err := c.doWithRetry(req, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("sign digest: %w", err)
@@ -160,7 +173,15 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 
 // doWithRetry 执行 HTTP 请求，在网络级错误时最多重试 1 次（Gap-4）
 // bodyBuf 是可重放的请求体（bytes.Reader 支持 Seek）
+// 如果请求没有关联 context 超时，会自动加上 defaultTimeout
 func (c *Client) doWithRetry(req *http.Request, bodyBuf *bytes.Reader) (*http.Response, error) {
+	// 如果请求没有设置 deadline，自动加上默认超时
+	if _, ok := req.Context().Deadline(); !ok {
+		ctx, cancel := context.WithTimeout(req.Context(), defaultTimeout)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err == nil {
 		return resp, nil
