@@ -37,6 +37,9 @@ func SignFullHandler(s *signer.Signer) http.HandlerFunc {
 			return
 		}
 
+		// 获取客户端提供的文件 SHA-256（可选，兼容旧版客户端）
+		expectedHash := r.Header.Get("X-Content-SHA256")
+
 		// 限制上传大小 2 GB
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
@@ -53,9 +56,19 @@ func SignFullHandler(s *signer.Signer) http.HandlerFunc {
 			defer closer.Close()
 		}
 
-		// 执行全量签名
-		result, err := s.FullSign(r.Context(), bodyReader, filename)
+		// 执行全量签名（传入 expectedHash 用于完整性校验）
+		result, err := s.FullSign(r.Context(), bodyReader, filename, expectedHash)
 		if err != nil {
+			// SHA-256 校验失败 → 409 Conflict（提示客户端重传）
+			if errors.Is(err, signer.ErrChecksumMismatch) {
+				slog.Warn("sign/full checksum mismatch",
+					"user", user, "file", filename,
+					"duration_ms", time.Since(start).Milliseconds())
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error": "checksum mismatch: file corrupted during transfer",
+				})
+				return
+			}
 			// 签名超时或客户端断开连接 → 503 Service Unavailable
 			if isTimeoutOrCanceled(err) || r.Context().Err() != nil {
 				slog.Info("sign/full timeout",

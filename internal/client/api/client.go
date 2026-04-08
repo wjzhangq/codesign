@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -245,7 +247,13 @@ func (c *Client) RawSign(digestHex, algo string) (*RawSignResponse, error) {
 	return &result, nil
 }
 
-// SignFull 上传完整文件进行全量签名（zstd 压缩）
+// signFullMaxRetries 大文件上传最大重试次数
+const signFullMaxRetries = 2
+
+// ErrChecksumMismatch 表示服务端校验 SHA-256 不匹配 (409)
+var ErrChecksumMismatch = fmt.Errorf("checksum mismatch: file corrupted during transfer")
+
+// SignFull 上传完整文件进行全量签名（zstd 压缩 + SHA-256 完整性校验 + 重试）
 func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -257,61 +265,125 @@ func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	fileSize := stat.Size()
 
-	// 使用 pipe 进行 zstd 流式压缩
-	pr, pw := io.Pipe()
-	go func() {
-		enc, err := zstd.NewWriter(pw)
-		if err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if _, err := io.Copy(enc, f); err != nil {
-			enc.Close()
-			pw.CloseWithError(err)
-			return
-		}
+	// 1. 计算原始文件的 SHA-256
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return nil, fmt.Errorf("compute file hash: %w", err)
+	}
+	fileHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// 2. 压缩到临时文件（使上传可重试；seek 回起点重传即可）
+	tmpFile, err := os.CreateTemp("", "codesign-upload-*.zst")
+	if err != nil {
+		return nil, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	// 回到文件开头进行压缩
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("seek file: %w", err)
+	}
+
+	enc, err := zstd.NewWriter(tmpFile)
+	if err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("create zstd encoder: %w", err)
+	}
+	if _, err := io.Copy(enc, f); err != nil {
 		enc.Close()
-		pw.Close()
-	}()
+		tmpFile.Close()
+		return nil, fmt.Errorf("compress file: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("finalize compression: %w", err)
+	}
+	tmpFile.Close()
 
-	// 动态超时: 基础 60s + 每 10MB 增加 10s
-	// 使用 context 而非修改 httpClient.Timeout，以保证并发安全
-	timeoutSecs := 60 + int(stat.Size()/(10*1024*1024))*10
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
-	defer cancel()
+	// 3. 打开压缩后的临时文件用于上传
+	compressedFile, err := os.Open(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("open compressed file: %w", err)
+	}
+	defer compressedFile.Close()
 
-	// 使用 filepath.Base 提取文件名，兼容所有平台路径分隔符
+	// 动态超时: 基础 60s + 每 10MB 增加 10s（基于原始文件大小）
+	timeoutSecs := 60 + int(fileSize/(10*1024*1024))*10
 	filename := filepath.Base(filePath)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign/full", pr)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Encoding", "zstd")
-	req.Header.Set("X-Filename", filename)
+	// 4. 带重试的上传
+	var lastErr error
+	for attempt := 0; attempt <= signFullMaxRetries; attempt++ {
+		if attempt > 0 {
+			fmt.Printf("        retry %d/%d...\n", attempt, signFullMaxRetries)
+			time.Sleep(time.Duration(attempt) * time.Second) // 递增退避
+			// seek 回压缩文件开头
+			if _, err := compressedFile.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("seek compressed file: %w", err)
+			}
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("sign full: %w", err)
-	}
-	defer resp.Body.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
 
+		req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign/full", compressedFile)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Content-Encoding", "zstd")
+		req.Header.Set("X-Filename", filename)
+		req.Header.Set("X-Content-SHA256", fileHash)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = fmt.Errorf("sign full: %w", err)
+			continue // 网络错误，重试
+		}
+
+		result, retryable, err := c.handleSignFullResponse(resp)
+		resp.Body.Close()
+		cancel()
+
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !retryable {
+			return nil, err // 不可重试的错误（认证失败等）直接返回
+		}
+	}
+
+	return nil, fmt.Errorf("sign full failed after %d retries: %w", signFullMaxRetries, lastErr)
+}
+
+// handleSignFullResponse 解析 SignFull 响应，返回 (result, retryable, error)
+func (c *Client) handleSignFullResponse(resp *http.Response) (*SignResponse, bool, error) {
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, ErrUnauthorized
+		return nil, false, ErrUnauthorized
+	}
+	// 409 Conflict = 完整性校验失败，可重试
+	if resp.StatusCode == http.StatusConflict {
+		return nil, true, ErrChecksumMismatch
 	}
 	if resp.StatusCode != http.StatusOK {
 		var errResp map[string]any
 		json.NewDecoder(resp.Body).Decode(&errResp) //nolint:errcheck
 		msg, _ := errResp["error"].(string)
-		return nil, fmt.Errorf("sign full failed (%d): %s", resp.StatusCode, msg)
+		// 5xx 可重试，4xx（除 409）不可重试
+		retryable := resp.StatusCode >= 500
+		return nil, retryable, fmt.Errorf("sign full failed (%d): %s", resp.StatusCode, msg)
 	}
 
 	var result SignResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode sign response: %w", err)
+		return nil, false, fmt.Errorf("decode sign response: %w", err)
 	}
-	return &result, nil
+	return &result, false, nil
 }

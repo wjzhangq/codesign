@@ -185,8 +185,8 @@ func signDigestMode(client *api.Client, filePath string, info *pe.PEInfo) error 
 func signFullMode(client *api.Client, filePath string, info *pe.PEInfo) error {
 	start := time.Now()
 
-	// [2/3] 上传并签名
-	fmt.Printf("  [2/3] Uploading & signing (full mode)...\n")
+	// [2/3] 上传并签名（含 SHA-256 完整性校验）
+	fmt.Printf("  [2/3] Uploading & signing (full mode, integrity check)...\n")
 	uploadStart := time.Now()
 
 	resp, err := client.SignFull(filePath)
