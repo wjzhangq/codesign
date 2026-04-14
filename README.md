@@ -2,19 +2,22 @@
 
 远程代码签名服务，支持 **PE 文件签名**（Authenticode）和 **XML 文档签名**（XMLDSIG）。
 
-- **PE 签名**：客户端在本地计算 Authenticode Digest，通过 HTTP API 发送给服务端，由服务端通过 signtool + eToken USB Key (SafeNet CSP) 完成签名，返回 Certificate Table，客户端将签名注入回本地文件。**全程不传输完整 PE 文件**（Digest 模式下网络传输约 9 KB）。
+- **PE 签名**：客户端在本地计算 Authenticode Digest，通过 HTTP API 发送给服务端，由服务端通过 eToken USB Key (SafeNet CSP) 完成签名，返回 Certificate Table，客户端将签名注入回本地文件。支持三种模式：**Raw 模式**（仅需 raw-sign.exe，传输约 200 字节）、**Digest 模式**（需 signtool /ds，传输约 9 KB）、**Full 模式**（上传完整文件）。
 - **XML 签名**：客户端在本地执行 XMLDSIG Enveloped 签名流程，仅将 SHA-256 Digest（64 字节 hex）发送给服务端，由服务端通过 [raw-sign.exe](https://github.com/wjzhangq/win-etoken-raw-sign) + eToken CSP 完成 RSA 签名，客户端将签名嵌入 XML 文档。**全程不传输私钥或原始文档**。
 
 ## 签名模式
 
 ### PE 签名
 
-| 模式 | 触发条件 | 上行 | 下行 |
-|------|---------|------|------|
-| **Digest 模式** (优先) | signtool `/ds` + CSP 验证通过 | ~4 KB (digest + unsigned PKCS#7) | ~5 KB (Certificate Table) |
-| **全量 Fallback** | Digest 模式不可用或服务端返回 501 | 完整文件 (zstd 压缩) | ~5 KB (Certificate Table) |
+| 模式 | 触发条件 | 上行 | 下行 | 服务端依赖 |
+|------|---------|------|------|-----------|
+| **Raw 模式** (推荐) | `raw_sign_path` 已配置 | ~200 bytes (digest) | ~5 KB (Certificate Table) | raw-sign.exe |
+| **Digest 模式** | signtool `/ds` + CSP 验证通过 | ~4 KB (digest + unsigned PKCS#7) | ~5 KB (Certificate Table) | signtool.exe |
+| **全量 Fallback** | 以上模式不可用或服务端返回 501 | 完整文件 (zstd 压缩) | ~5 KB (Certificate Table) | signtool.exe |
 
-两种模式均只回传 Certificate Table，客户端本地完成签名注入。
+三种模式均只回传 Certificate Table，客户端本地完成签名注入。
+
+**Raw 模式** 与 Digest 模式的区别：Raw 模式完全不依赖 signtool，由服务端 Go 代码自行构造 PKCS#7 SignedData（通过 raw-sign.exe 获取 RSA 签名），无需 stub PE、无需 `/ds` + `/di`，请求体也更小（只传 32 字节 digest 的 base64）。
 
 ### XML 签名 (XMLDSIG)
 
@@ -29,7 +32,24 @@
 
 ## 架构
 
-### PE 签名
+### PE 签名 — Raw 模式 (推荐)
+
+```
+客户端 (Go CLI, 跨平台)                    服务端 (Go, Windows + eToken)
+──────────────────────                    ─────────────────────────────
+PE 解析 → Authenticode Digest 计算
+  POST /api/sign/raw                ────► JWT 验证
+  { filename, dig(base64) }               AuthAttrsDigest() → SHA-256
+  ~200 bytes                              raw-sign.exe → RSA 签名
+                                          BuildSignedPKCS7() → PKCS#7
+                                          BuildWinCertificate()
+  { certificate_table }  ◄────────────    返回 Certificate Table
+  ~5 KB
+← 签名注入到本地 PE 文件
+  (更新 Security Dir + CheckSum, 原子替换)
+```
+
+### PE 签名 — Digest 模式
 
 ```
 客户端 (Go CLI, 跨平台)                    服务端 (Go, Windows + eToken)
@@ -86,6 +106,7 @@ codesign/
 │   │   ├── config/config.go       # INI 配置解析
 │   │   ├── handler/               # HTTP handlers
 │   │   │   ├── raw_sign.go        # POST /api/raw-sign
+│   │   │   ├── sign_raw.go        # POST /api/sign/raw (Raw 模式 PE 签名)
 │   │   │   ├── health.go          # GET /api/health
 │   │   │   ├── sign_digest.go     # POST /api/sign
 │   │   │   ├── sign_full.go       # POST /api/sign/full
@@ -94,6 +115,7 @@ codesign/
 │   │   ├── signer/                # signtool + raw-sign 封装
 │   │   │   ├── signer.go          # eToken 互斥锁
 │   │   │   ├── rawsign.go         # RawSign 方法
+│   │   │   ├── raw_digest.go      # RawDigestSign 方法 (Raw 模式 PE 签名)
 │   │   │   ├── digest.go          # DigestSign 方法
 │   │   │   └── full.go            # FullSign 方法
 │   │   ├── token/manager.go       # JWT 签发 / 撤销 / 持久化
@@ -118,12 +140,12 @@ codesign/
 | OS | Windows 10/11 或 Windows Server 2019+ |
 | Go | 1.22+ |
 | signtool | Windows SDK 10.0.22621.0+（PE 签名） |
-| raw-sign.exe | [wjzhangq/win-etoken-raw-sign](https://github.com/wjzhangq/win-etoken-raw-sign)（XML 签名，可选） |
+| raw-sign.exe | [wjzhangq/win-etoken-raw-sign](https://github.com/wjzhangq/win-etoken-raw-sign)（Raw 模式 PE 签名 + XML 签名） |
 | SafeNet 驱动 | SafeNet Authentication Client 10.x |
 | eToken | 已插入 USB，已初始化，已导入代码签名证书 |
 | 证书文件 | `.cer` 格式 DER 编码公钥证书 |
 
-> `raw-sign.exe` 仅在需要 XML 签名（XMLDSIG）时才需要部署。PE 签名不依赖它。
+> **提示**: 如果只使用 Raw 模式签名 PE 文件 + XML 签名，可以不安装 signtool / Windows SDK，只需部署 `raw-sign.exe`。
 
 ### 客户端
 
@@ -162,7 +184,7 @@ token_db   = tokens.json
 
 [sign]
 signtool_path = C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe
-# raw-sign.exe 路径（XML 签名时必填，PE 签名可不填）
+# raw-sign.exe 路径（Raw 模式 PE 签名 + XML 签名时必填）
 raw_sign_path = C:\raw-sign.exe
 cert_path     = C:\certs\code-signing.cer
 csp_name      = eToken Base Cryptographic Provider
@@ -219,8 +241,9 @@ codesign sign app.exe
 codesign sign app.exe helper.dll driver.sys
 
 # 指定模式
-codesign sign --mode digest app.exe
-codesign sign --mode full   app.exe
+codesign sign --mode raw    app.exe   # Raw 模式 (推荐，仅需 raw-sign.exe)
+codesign sign --mode digest app.exe   # Digest 模式 (需 signtool /ds)
+codesign sign --mode full   app.exe   # 全量上传模式
 
 # 覆盖服务器配置
 codesign sign --server http://localhost:8443 --token xxx app.exe
@@ -299,7 +322,7 @@ codesign raw-sign --digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
   "cert_subject": "CN=My Company",
   "cert_expires": "2027-01-01",
   "time": "2026-04-05T10:00:00Z",
-  "capabilities": ["pe-sign", "pe-digest", "raw-sign", "xmldsig"]
+  "capabilities": ["pe-sign", "pe-digest", "raw-sign", "xmldsig", "pe-raw"]
 }
 ```
 
@@ -309,6 +332,7 @@ codesign raw-sign --digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 |----|------|
 | `pe-sign` | 始终存在，支持 PE 全量签名 |
 | `pe-digest` | `digest_mode = true` 时存在 |
+| `pe-raw` | `raw_sign_path` 已配置时存在，支持 Raw 模式 PE 签名 |
 | `raw-sign` | `raw_sign_path` 已配置时存在 |
 | `xmldsig` | 同上（`raw-sign` 是 XMLDSIG 的前提）|
 
@@ -377,6 +401,42 @@ Body 限制: 2 GB (压缩后)；解压后最大 400 MB
   "security_dir_size": 4688
 }
 ```
+
+### POST /api/sign/raw — Raw 模式 PE 签名
+
+使用 raw-sign.exe 完成 Authenticode 签名，不依赖 signtool。服务端自行构造 PKCS#7 SignedData。
+
+```
+Content-Type: application/json
+Body 限制: 16 KB
+```
+
+请求：
+
+```json
+{
+  "filename": "app.exe",
+  "dig": "<base64 of SHA-256 Authenticode digest, 32 bytes>"
+}
+```
+
+响应 200：
+
+```json
+{
+  "certificate_table": "<base64 of WIN_CERTIFICATE>"
+}
+```
+
+响应 501（`raw_sign_path` 未配置）：
+
+```json
+{
+  "error": "raw sign mode not available: raw_sign_path not configured"
+}
+```
+
+与 Digest 模式对比：Raw 模式只需传 digest（32 字节的 base64），不需要传 `.p7u` 和 `pe_info`，因为 PKCS#7 在服务端构造。
 
 ### POST /api/raw-sign — 原始摘要签名
 
@@ -458,5 +518,5 @@ go test ./...
 
 | 工具 | 用途 | 仓库 |
 |------|------|------|
-| `signtool.exe` | PE Authenticode 签名 | Windows SDK |
-| `raw-sign.exe` | eToken RSA 原始签名（XMLDSIG 使用）| [wjzhangq/win-etoken-raw-sign](https://github.com/wjzhangq/win-etoken-raw-sign) |
+| `signtool.exe` | PE Authenticode 签名 (Digest / Full 模式) | Windows SDK |
+| `raw-sign.exe` | eToken RSA 原始签名（Raw 模式 PE 签名 + XMLDSIG）| [wjzhangq/win-etoken-raw-sign](https://github.com/wjzhangq/win-etoken-raw-sign) |

@@ -26,7 +26,7 @@ func HealthHandler(cfg *config.Config) http.HandlerFunc {
 			capabilities = append(capabilities, "pe-digest")
 		}
 		if cfg.RawSignPath != "" {
-			capabilities = append(capabilities, "raw-sign", "xmldsig")
+			capabilities = append(capabilities, "raw-sign", "xmldsig", "pe-raw")
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{

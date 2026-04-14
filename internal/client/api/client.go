@@ -199,6 +199,57 @@ func (c *Client) doWithRetry(req *http.Request, bodyBuf *bytes.Reader) (*http.Re
 	return c.httpClient.Do(req)
 }
 
+// SignRawDigestRequest Raw 模式签名请求
+type SignRawDigestRequest struct {
+	Filename string `json:"filename"`
+	Dig      string `json:"dig"` // base64 of Authenticode digest (32 bytes)
+}
+
+// SignRawDigest 发送 Raw 模式签名请求（使用 raw-sign 完成 Authenticode 签名）
+func (c *Client) SignRawDigest(filename, digB64 string) (*SignResponse, error) {
+	reqBody := SignRawDigestRequest{
+		Filename: filename,
+		Dig:      digB64,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", c.server+"/api/sign/raw", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.doWithRetry(req, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("sign raw: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode == http.StatusNotImplemented {
+		return nil, ErrFallbackRequired
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp map[string]any
+		json.NewDecoder(resp.Body).Decode(&errResp) //nolint:errcheck
+		msg, _ := errResp["error"].(string)
+		return nil, fmt.Errorf("sign raw failed (%d): %s", resp.StatusCode, msg)
+	}
+
+	var result SignResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode sign response: %w", err)
+	}
+	return &result, nil
+}
+
 // RawSignResponse raw-sign 响应
 type RawSignResponse struct {
 	Signature string `json:"signature"`

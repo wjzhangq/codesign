@@ -151,29 +151,11 @@ func buildSpcIndirectDataContent(digest []byte) ([]byte, error) {
 }
 
 func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
-	// 构造 authenticated attributes
-	// 1. ContentType = SpcIndirectDataContent
-	contentTypeAttr, err := buildAttr(oidContentType, oidSpcIndirectDataContent)
+	// 复用 buildAuthAttrsContent 构造 authenticated attributes
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
 	if err != nil {
 		return nil, err
 	}
-
-	// 2. SpcSpOpusInfo (空)
-	opusInfoAttr, err := buildOpusInfoAttr()
-	if err != nil {
-		return nil, err
-	}
-
-	// 3. MessageDigest = SHA-256(indirectData DER)
-	// signtool /ds 验证此值，必须与 indirectData 内容的 hash 匹配
-	msgDigestBytes := sha256.Sum256(indirectData)
-	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: msgDigestBytes[:]})
-	if err != nil {
-		return nil, err
-	}
-
-	// 将三个 attribute 组合成 SET
-	authAttrsBytes := append(append(contentTypeAttr, opusInfoAttr...), msgDigestAttr...)
 
 	si := signerInfo{
 		Version: 1,
@@ -299,6 +281,148 @@ func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 		Bytes:      append(oidDER, valSetDER...),
 	}
 	return asn1.Marshal(attrSeq)
+}
+
+// BuildSignedPKCS7 构造已签名的 PKCS#7 (完整 Authenticode 签名)
+// 流程:
+//  1. 构造 SpcIndirectDataContent
+//  2. 构造 authenticatedAttributes（含 ContentType, SpcSpOpusInfo, MessageDigest）
+//  3. 将 authAttrs 的 DER (tag 改为 SET OF 0x31) 做 SHA-256 → authAttrsDigest
+//  4. 用传入的 rsaSignature (由 raw-sign 对 authAttrsDigest 签名得到) 填充 EncryptedDigest
+//  5. 组装完整 SignedData
+//
+// 参数:
+//   - digest:       Authenticode SHA-256 摘要 (32 bytes)
+//   - certDER:      签名证书 DER 编码
+//   - rsaSignature: RSA-PKCS1v15-SHA256 签名值 (big-endian)
+func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte) ([]byte, error) {
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse cert: %w", err)
+	}
+
+	// 1. 构造 SpcIndirectDataContent
+	indirectData, err := buildSpcIndirectDataContent(digest)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 构造 SignerInfo（包含签名值）
+	signedSignerInfo, err := buildSignedSignerInfo(cert, indirectData, rsaSignature)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. 构造 SignedData
+	signedData, err := buildSignedData(cert, indirectData, signedSignerInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. 包装为 ContentInfo
+	contentInfo := pkcs7ContentInfo{
+		ContentType: oidSignedData,
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: signedData},
+	}
+
+	return asn1.Marshal(contentInfo)
+}
+
+// AuthAttrsDigest 构造 authenticatedAttributes 并计算其 SHA-256 摘要
+// 返回 hex 编码的摘要（可直接发送给 /api/raw-sign）
+//
+// PKCS#7 规范要求: 签名时 authenticatedAttributes 使用 SET OF (tag 0x31) 编码,
+// 而非 SignerInfo 中的 IMPLICIT [0] (tag 0xA0)
+func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) {
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return "", fmt.Errorf("parse cert: %w", err)
+	}
+
+	// 构造 SpcIndirectDataContent（用于计算 MessageDigest attribute 值）
+	indirectData, err := buildSpcIndirectDataContent(authenticodeDigest)
+	if err != nil {
+		return "", err
+	}
+
+	// 构造 authAttrs 内容
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
+	if err != nil {
+		return "", err
+	}
+
+	// 包装为 SET OF (tag 0x31) 用于签名
+	authAttrsForSign := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSet,
+		IsCompound: true,
+		Bytes:      authAttrsBytes,
+	}
+	authAttrsDER, err := asn1.Marshal(authAttrsForSign)
+	if err != nil {
+		return "", fmt.Errorf("marshal authAttrs for signing: %w", err)
+	}
+
+	// SHA-256
+	h := sha256.Sum256(authAttrsDER)
+	return fmt.Sprintf("%x", h), nil
+}
+
+// buildAuthAttrsContent 构造 authenticatedAttributes 的内容部分（三个 attribute 拼接）
+func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
+	// 1. ContentType = SpcIndirectDataContent
+	contentTypeAttr, err := buildAttr(oidContentType, oidSpcIndirectDataContent)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. SpcSpOpusInfo (空)
+	opusInfoAttr, err := buildOpusInfoAttr()
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. MessageDigest = SHA-256(indirectData DER)
+	msgDigestBytes := sha256.Sum256(indirectData)
+	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: msgDigestBytes[:]})
+	if err != nil {
+		return nil, err
+	}
+
+	return append(append(contentTypeAttr, opusInfoAttr...), msgDigestAttr...), nil
+}
+
+// buildSignedSignerInfo 构造包含签名值的 SignerInfo
+func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSignature []byte) ([]byte, error) {
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
+	if err != nil {
+		return nil, err
+	}
+
+	si := signerInfo{
+		Version: 1,
+		IssuerAndSerial: issuerAndSerialNumber{
+			Issuer:       asn1.RawValue{FullBytes: cert.RawIssuer},
+			SerialNumber: cert.SerialNumber,
+		},
+		DigestAlgorithm: algorithmIdentifier{
+			Algorithm:  oidSHA256,
+			Parameters: asn1.RawValue{Tag: asn1.TagNull},
+		},
+		AuthenticatedAttrs: asn1.RawValue{
+			Class:      2,
+			Tag:        0,
+			IsCompound: true,
+			Bytes:      authAttrsBytes,
+		},
+		DigestEncAlgorithm: algorithmIdentifier{
+			Algorithm:  oidSHA256WithRSA,
+			Parameters: asn1.RawValue{Tag: asn1.TagNull},
+		},
+		EncryptedDigest: rsaSignature, // 已签名的值
+	}
+
+	return asn1.Marshal(si)
 }
 
 func buildOpusInfoAttr() ([]byte, error) {

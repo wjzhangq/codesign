@@ -24,7 +24,7 @@ func SignCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "mode",
-				Usage: "Signing mode: auto, digest, full (default: full)",
+				Usage: "Signing mode: auto, digest, raw, full (default: full)",
 				Value: "full",
 			},
 			&cli.StringFlag{
@@ -121,6 +121,14 @@ func signFile(client *api.Client, filePath, mode string) error {
 			}
 			return err
 		}
+	case "raw":
+		if err := signRawMode(client, filePath, info); err != nil {
+			if errors.Is(err, api.ErrFallbackRequired) {
+				fmt.Printf("  ⚠ Raw mode unavailable, falling back to full upload\n")
+				return signFullMode(client, filePath, info)
+			}
+			return err
+		}
 	case "full", "full_only":
 		return signFullMode(client, filePath, info)
 	default:
@@ -208,6 +216,45 @@ func signFullMode(client *api.Client, filePath string, info *pe.PEInfo) error {
 
 	fmt.Printf("        Certificate Table: %d bytes, CheckSum: 0x%X\n",
 		len(certTable), resp.Checksum)
+	fmt.Printf("  ✓ Signed in %.1fs\n", time.Since(start).Seconds())
+	return nil
+}
+
+func signRawMode(client *api.Client, filePath string, info *pe.PEInfo) error {
+	start := time.Now()
+
+	// [2/4] 计算 Authenticode Digest
+	fmt.Printf("  [2/4] Computing Authenticode digest...\n")
+	digestStart := time.Now()
+	digest, err := pe.ComputeAuthenticodeDigest(filePath, info)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("        SHA-256: %x (%.1fs)\n", digest, time.Since(digestStart).Seconds())
+
+	// [3/4] 远程签名 (raw 模式 — 服务端使用 raw-sign 完成 PKCS#7 构造)
+	fmt.Printf("  [3/4] Remote signing (raw mode)...\n")
+	remoteStart := time.Now()
+	digB64 := base64.StdEncoding.EncodeToString(digest)
+
+	resp, err := client.SignRawDigest(filepath.Base(filePath), digB64)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("        remote: %.1fs\n", time.Since(remoteStart).Seconds())
+
+	// [4/4] 注入签名
+	fmt.Printf("  [4/4] Injecting signature...\n")
+	certTable, err := base64.StdEncoding.DecodeString(resp.CertificateTable)
+	if err != nil {
+		return fmt.Errorf("decode certificate table: %w", err)
+	}
+
+	if err := pe.InjectSignature(filePath, info, certTable); err != nil {
+		return fmt.Errorf("inject signature: %w", err)
+	}
+
+	fmt.Printf("        Certificate Table: %d bytes\n", len(certTable))
 	fmt.Printf("  ✓ Signed in %.1fs\n", time.Since(start).Seconds())
 	return nil
 }
