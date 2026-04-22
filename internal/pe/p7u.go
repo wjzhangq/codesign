@@ -50,9 +50,22 @@ func BuildUnsignedPKCS7(digest []byte, certDER []byte) ([]byte, error) {
 	}
 
 	// 4. 包装为 ContentInfo
+	// 注意: Go 的 asn1.Marshal 对 RawValue 字段会忽略 struct tag (explicit,tag:0)，
+	// RawValue 会被原样编码。所以需要手动构造:
+	//   [0] EXPLICIT { SEQUENCE { signedData elements } }
+	// 先将 signedData 包装为 SEQUENCE (SignedData 是 SEQUENCE 类型),
+	// 再作为 [0] 的 Bytes。
+	signedDataSeqDER, err := asn1.Marshal(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagSequence, IsCompound: true,
+		Bytes: signedData,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal SignedData SEQUENCE: %w", err)
+	}
+
 	contentInfo := pkcs7ContentInfo{
 		ContentType: oidSignedData,
-		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: signedData},
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: signedDataSeqDER},
 	}
 
 	return asn1.Marshal(contentInfo)
@@ -185,6 +198,9 @@ func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error
 
 func buildSignedData(cert *x509.Certificate, indirectData []byte, signerInfoDER []byte) ([]byte, error) {
 	// ContentInfo for SpcIndirectDataContent
+	// Go 的 asn1.Marshal 对 RawValue 忽略 struct tag，
+	// 所以 Class:2 Tag:0 直接编码为 [0]，Bytes 中的 indirectData 已是完整 DER (30 ...),
+	// 最终得到正确的: [0] EXPLICIT { SEQUENCE { SpcIndirectDataContent } }
 	contentInfo := struct {
 		ContentType asn1.ObjectIdentifier
 		Content     asn1.RawValue `asn1:"explicit,tag:0"`
@@ -319,10 +335,18 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte) ([]byt
 		return nil, err
 	}
 
-	// 4. 包装为 ContentInfo
+	// 4. 包装为 ContentInfo (与 BuildUnsignedPKCS7 相同逻辑)
+	signedDataSeqDER, err := asn1.Marshal(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagSequence, IsCompound: true,
+		Bytes: signedData,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal SignedData SEQUENCE: %w", err)
+	}
+
 	contentInfo := pkcs7ContentInfo{
 		ContentType: oidSignedData,
-		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: signedData},
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: signedDataSeqDER},
 	}
 
 	return asn1.Marshal(contentInfo)

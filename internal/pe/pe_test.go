@@ -1,10 +1,17 @@
 package pe
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/asn1"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"os"
 	"testing"
+	"time"
 )
 
 // buildTestPE 构建一个用于测试的最小 PE32+ 文件
@@ -374,4 +381,192 @@ func TestDigest_AlignedConsistency(t *testing.T) {
 		}
 	}
 	t.Logf("unaligned file (0x203) digest: %x", d1)
+}
+
+// generateTestCert 生成一个自签名测试证书
+func generateTestCert(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return certDER
+}
+
+// TestBuildSignedPKCS7_ASN1Structure 验证 BuildSignedPKCS7 生成的 ASN.1 结构正确
+// 关键检查: 外层 ContentInfo 的 content 是 [0] EXPLICIT { SEQUENCE { ... } }
+// 而不是错误的 [0] EXPLICIT { [0] { ... } }（双重 [0] 嵌套）
+func TestBuildSignedPKCS7_ASN1Structure(t *testing.T) {
+	certDER := generateTestCert(t)
+	fakeDigest := make([]byte, 32)
+	fakeRSASig := make([]byte, 256)
+
+	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, fakeRSASig)
+	if err != nil {
+		t.Fatalf("BuildSignedPKCS7: %v", err)
+	}
+
+	// 解析外层 ContentInfo SEQUENCE
+	var outer asn1.RawValue
+	rest, err := asn1.Unmarshal(pkcs7DER, &outer)
+	if err != nil {
+		t.Fatalf("unmarshal outer: %v", err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("trailing bytes: %d", len(rest))
+	}
+	if outer.Tag != asn1.TagSequence {
+		t.Fatalf("outer tag: got 0x%02X, want 0x10 (SEQUENCE)", outer.Tag)
+	}
+
+	// 解析 ContentInfo 内部: OID + [0] EXPLICIT content
+	var oid asn1.ObjectIdentifier
+	rest, err = asn1.Unmarshal(outer.Bytes, &oid)
+	if err != nil {
+		t.Fatalf("unmarshal OID: %v", err)
+	}
+	if !oid.Equal(oidSignedData) {
+		t.Fatalf("contentType: got %v, want %v", oid, oidSignedData)
+	}
+
+	// 解析 [0] EXPLICIT wrapper
+	var explicit0 asn1.RawValue
+	rest, err = asn1.Unmarshal(rest, &explicit0)
+	if err != nil {
+		t.Fatalf("unmarshal [0] wrapper: %v", err)
+	}
+	if explicit0.Class != asn1.ClassContextSpecific || explicit0.Tag != 0 {
+		t.Fatalf("[0] wrapper: got class=%d tag=%d, want class=2 tag=0", explicit0.Class, explicit0.Tag)
+	}
+
+	// 关键检查: [0] 内部的第一个元素应该是 SEQUENCE (0x30)，不是 [0] (0xa0)
+	var signedDataSeq asn1.RawValue
+	_, err = asn1.Unmarshal(explicit0.Bytes, &signedDataSeq)
+	if err != nil {
+		t.Fatalf("unmarshal SignedData: %v", err)
+	}
+
+	if signedDataSeq.Class != asn1.ClassUniversal || signedDataSeq.Tag != asn1.TagSequence {
+		t.Errorf("SignedData: got class=%d tag=%d (0x%02X), want class=0 tag=16 (0x30 SEQUENCE)",
+			signedDataSeq.Class, signedDataSeq.Tag, signedDataSeq.Tag|(signedDataSeq.Class<<6))
+		if signedDataSeq.Class == asn1.ClassContextSpecific && signedDataSeq.Tag == 0 {
+			t.Error("BUG: SignedData is [0] CONTEXT instead of SEQUENCE — double [0] wrapping detected!")
+		}
+	}
+
+	// 解析 SignedData 内部: version, digestAlgorithms, encapContentInfo, ...
+	// 检查 encapContentInfo 的 content [0] 也是正确的
+	var version int
+	inner := signedDataSeq.Bytes
+	inner, err = asn1.Unmarshal(inner, &version)
+	if err != nil {
+		t.Fatalf("unmarshal version: %v", err)
+	}
+	if version != 1 {
+		t.Errorf("version: got %d, want 1", version)
+	}
+
+	// Skip digestAlgorithms SET
+	var digestAlgs asn1.RawValue
+	inner, err = asn1.Unmarshal(inner, &digestAlgs)
+	if err != nil {
+		t.Fatalf("unmarshal digestAlgorithms: %v", err)
+	}
+
+	// encapContentInfo SEQUENCE
+	var encapCI asn1.RawValue
+	_, err = asn1.Unmarshal(inner, &encapCI)
+	if err != nil {
+		t.Fatalf("unmarshal encapContentInfo: %v", err)
+	}
+	if encapCI.Tag != asn1.TagSequence {
+		t.Fatalf("encapContentInfo tag: got 0x%02X, want SEQUENCE", encapCI.Tag)
+	}
+
+	// 解析 encapContentInfo: OID + [0] EXPLICIT { SpcIndirectDataContent }
+	var ecOID asn1.ObjectIdentifier
+	ecRest, err := asn1.Unmarshal(encapCI.Bytes, &ecOID)
+	if err != nil {
+		t.Fatalf("unmarshal encapContentInfo OID: %v", err)
+	}
+
+	var ecContent asn1.RawValue
+	_, err = asn1.Unmarshal(ecRest, &ecContent)
+	if err != nil {
+		t.Fatalf("unmarshal encapContentInfo [0]: %v", err)
+	}
+	if ecContent.Class != asn1.ClassContextSpecific || ecContent.Tag != 0 {
+		t.Fatalf("encapContentInfo content: got class=%d tag=%d, want [0]", ecContent.Class, ecContent.Tag)
+	}
+
+	// 关键检查: [0] 内部应该是 SEQUENCE（SpcIndirectDataContent），不是另一个 [0]
+	var spcContent asn1.RawValue
+	_, err = asn1.Unmarshal(ecContent.Bytes, &spcContent)
+	if err != nil {
+		t.Fatalf("unmarshal SpcIndirectDataContent: %v", err)
+	}
+	if spcContent.Class != asn1.ClassUniversal || spcContent.Tag != asn1.TagSequence {
+		t.Errorf("SpcIndirectDataContent: got class=%d tag=%d, want SEQUENCE",
+			spcContent.Class, spcContent.Tag)
+		if spcContent.Class == asn1.ClassContextSpecific && spcContent.Tag == 0 {
+			t.Error("BUG: SpcIndirectDataContent is [0] CONTEXT — double wrapping in encapContentInfo!")
+		}
+	}
+
+	t.Logf("PKCS#7 ASN.1 structure is correct: ContentInfo > [0] > SEQUENCE(SignedData) > ... > [0] > SEQUENCE(SpcIndirectDataContent)")
+}
+
+// TestBuildUnsignedPKCS7_ASN1Structure 验证 BuildUnsignedPKCS7 的 ASN.1 结构也正确
+func TestBuildUnsignedPKCS7_ASN1Structure(t *testing.T) {
+	certDER := generateTestCert(t)
+	fakeDigest := make([]byte, 32)
+
+	pkcs7DER, err := BuildUnsignedPKCS7(fakeDigest, certDER)
+	if err != nil {
+		t.Fatalf("BuildUnsignedPKCS7: %v", err)
+	}
+
+	// 解析外层
+	var outer asn1.RawValue
+	_, err = asn1.Unmarshal(pkcs7DER, &outer)
+	if err != nil {
+		t.Fatalf("unmarshal outer: %v", err)
+	}
+
+	// OID
+	var oid asn1.ObjectIdentifier
+	rest, err := asn1.Unmarshal(outer.Bytes, &oid)
+	if err != nil {
+		t.Fatalf("unmarshal OID: %v", err)
+	}
+
+	// [0] EXPLICIT
+	var explicit0 asn1.RawValue
+	_, err = asn1.Unmarshal(rest, &explicit0)
+	if err != nil {
+		t.Fatalf("unmarshal [0]: %v", err)
+	}
+
+	// [0] 内部应该是 SEQUENCE
+	var signedDataSeq asn1.RawValue
+	_, err = asn1.Unmarshal(explicit0.Bytes, &signedDataSeq)
+	if err != nil {
+		t.Fatalf("unmarshal SignedData: %v", err)
+	}
+
+	if signedDataSeq.Class != asn1.ClassUniversal || signedDataSeq.Tag != asn1.TagSequence {
+		t.Errorf("SignedData in unsigned PKCS7: got class=%d tag=%d, want SEQUENCE",
+			signedDataSeq.Class, signedDataSeq.Tag)
+	} else {
+		t.Log("Unsigned PKCS#7 ASN.1 structure is correct")
+	}
 }
