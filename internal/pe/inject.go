@@ -52,6 +52,19 @@ func InjectSignature(filePath string, info *PEInfo, certTable []byte) error {
 			return fmt.Errorf("stat tmp: %w", err)
 		}
 		writeOff = stat.Size()
+
+		// PE 规范要求 Certificate Table 位于 8 字节对齐的文件偏移处。
+		// signtool 签名时会先将文件补齐到 8 字节边界再追加 WIN_CERTIFICATE。
+		// 这里同样补齐，保证 Authenticode 摘要一致。
+		aligned := alignUp(writeOff, 8)
+		if aligned != writeOff {
+			pad := make([]byte, aligned-writeOff)
+			if _, err := f.WriteAt(pad, writeOff); err != nil {
+				f.Close()
+				return fmt.Errorf("write alignment padding: %w", err)
+			}
+			writeOff = aligned
+		}
 	}
 
 	// 3. 追加 Certificate Table
@@ -93,6 +106,11 @@ func InjectSignature(filePath string, info *PEInfo, certTable []byte) error {
 
 	success = true
 	return nil
+}
+
+// alignUp 将 v 向上对齐到 alignment 的整数倍
+func alignUp(v int64, alignment int64) int64 {
+	return (v + alignment - 1) &^ (alignment - 1)
 }
 
 // copyFile 复制文件

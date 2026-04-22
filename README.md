@@ -493,6 +493,20 @@ go test ./...
 
 单元测试覆盖：PE 解析、Authenticode Digest 计算、CheckSum、签名注入/提取、JWT 创建/验证/撤销/持久化、XMLDSIG 签名结构验证（含重签名、namespace 处理），无需 Windows 环境即可运行。
 
+## 已知问题修复
+
+### 大文件签名无效 (Certificate Table 8 字节对齐)
+
+**现象**：对文件大小不是 8 字节倍数的 PE 文件签名后，Windows 报告签名无效。例如 76,918,043 字节的 EXE 文件（`76918043 % 8 = 3`）。
+
+**根因**：`signtool` 签名时会先将文件填充（pad）到 8 字节边界再追加 WIN_CERTIFICATE，Authenticode 摘要中包含了这些填充零字节。但客户端 `InjectSignature` 直接将 Certificate Table 写入原始文件末尾（不对齐），导致验证时重新计算的摘要与签名内的摘要不匹配。
+
+**修复**：
+- `pe/inject.go`：注入签名前将文件填充到 8 字节对齐边界
+- `pe/digest.go`：Authenticode 摘要计算时将哈希区域扩展到 8 字节对齐边界（填充零字节参与哈希），保证 digest/raw 模式下客户端计算的摘要与 signtool 一致
+
+此修复影响所有三种签名模式（Raw / Digest / Full），对文件大小已是 8 字节倍数的文件无影响。
+
 ## 安全设计
 
 - **JWT**：HMAC-SHA256 自实现，含 `jti` 随机字段；重新颁发 Token 时旧 Token 立即失效

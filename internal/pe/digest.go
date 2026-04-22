@@ -57,19 +57,38 @@ func computeDigest(r io.ReadSeeker, info *PEInfo) ([]byte, error) {
 		return nil, err
 	}
 
-	// 区段 3: [SecurityDirOffset+8, CertTableOffset or EOF)
+	// 区段 3: [SecurityDirOffset+8, CertTableOffset or aligned EOF)
 	var end int64
 	if info.CertTableOffset > 0 {
 		end = int64(info.CertTableOffset)
 	} else {
-		end = info.FileSize
+		// 无签名时，Certificate Table 将写入 8 字节对齐后的偏移处。
+		// signtool 签名前也会先将文件补齐到 8 字节边界，因此对齐填充
+		// 的零字节需要纳入摘要计算，否则摘要与 signtool 不一致。
+		end = alignUp(info.FileSize, 8)
 	}
 
 	seg3Start := int64(info.SecurityDirOffset) + 8
 	seg3Len := end - seg3Start
 	if seg3Len > 0 {
-		if err := copyN(h, r, seg3Len); err != nil {
-			return nil, fmt.Errorf("hash main body: %w", err)
+		// 先哈希文件中实际存在的字节
+		fileRemain := info.FileSize - seg3Start
+		if fileRemain < 0 {
+			fileRemain = 0
+		}
+		if fileRemain > seg3Len {
+			fileRemain = seg3Len
+		}
+		if fileRemain > 0 {
+			if err := copyN(h, r, fileRemain); err != nil {
+				return nil, fmt.Errorf("hash main body: %w", err)
+			}
+		}
+		// 对齐填充部分以零字节写入哈希
+		padLen := seg3Len - fileRemain
+		if padLen > 0 {
+			pad := make([]byte, padLen)
+			h.Write(pad)
 		}
 	}
 
