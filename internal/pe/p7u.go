@@ -137,9 +137,24 @@ type spcIndirectDataContent struct {
 }
 
 func buildSpcIndirectDataContent(digest []byte) ([]byte, error) {
-	// SpcPeImageData
+	// SpcPeImageData — 包含 flags 和 file 两个字段
+	// file 字段是 SpcLink，Authenticode 规范要求必须存在。
+	// 使用 file → SpcString(unicode) 指向空 BMPString，
+	// 与 signtool 生成的签名一致：
+	//   [0] CONSTRUCTED {            -- SpcPeImageData.file
+	//     [2] CONSTRUCTED {          -- SpcLink CHOICE: file (SpcString)
+	//       [0] PRIMITIVE "\x00\x00" -- SpcString CHOICE: unicode (BMPString)
+	//     }
+	//   }
+	spcLinkFileContent := []byte{0xa2, 0x04, 0x80, 0x02, 0x00, 0x00}
 	peImageData := spcPeImageData{
 		Flags: asn1.BitString{Bytes: []byte{0}, BitLength: 0},
+		File: asn1.RawValue{
+			Class:      asn1.ClassContextSpecific,
+			Tag:        0,
+			IsCompound: true,
+			Bytes:      spcLinkFileContent,
+		},
 	}
 	peImageDataDER, err := asn1.Marshal(peImageData)
 	if err != nil {

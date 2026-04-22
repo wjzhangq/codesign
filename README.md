@@ -507,6 +507,33 @@ go test ./...
 
 此修复影响所有三种签名模式（Raw / Digest / Full），对文件大小已是 8 字节倍数的文件无影响。
 
+### Raw 模式签名后 Windows 提示"主题中没有签名" (SpcPeImageData 缺少 File 字段)
+
+**现象**：使用 Raw 模式（`--mode raw`）签名后，Windows 右键属性可以看到签名，但点击签名详情后提示"主题中没有签名"。`osslsigncode verify` 报告 "Failed to extract a page hash"。Digest 模式和 Full 模式（走 signtool）签名正常。
+
+**根因**：`internal/pe/p7u.go` 中 `buildSpcIndirectDataContent()` 构造的 `SpcPeImageData` 结构缺少 `File`（SpcLink）字段。Authenticode 规范要求 `SpcPeImageData` 必须包含 `flags`（BitString）和 `file`（SpcLink）两个字段，而原实现只编码了 `flags`：
+
+```
+修复前: SEQUENCE { BIT STRING (03 02 00 00) }  — 仅 flags，6 bytes
+修复后: SEQUENCE { BIT STRING (03 02 00 00), [0] { [2] { [0] "\x00\x00" } } }  — flags + file，14 bytes
+```
+
+signtool 生成的签名始终包含 `file` 字段指向一个空的 BMPString（`\x00\x00`），Windows 验签器依赖该字段判断 SpcIndirectDataContent 的完整性。
+
+**修复**：`internal/pe/p7u.go` 的 `buildSpcIndirectDataContent()` 新增 `File` 字段，使用手工构造的 SpcLink 字节序列 `a0 06 a2 04 80 02 00 00`，与 signtool 输出一致：
+
+```
+[0] CONSTRUCTED {            -- SpcPeImageData.file
+  [2] CONSTRUCTED {          -- SpcLink CHOICE: file (SpcString)
+    [0] PRIMITIVE "\x00\x00" -- SpcString CHOICE: unicode (BMPString)
+  }
+}
+```
+
+**影响**：仅影响 Raw 模式（服务端 Go 代码自行构造 PKCS#7）。修复后需重新编译服务端并重新签名受影响的文件。Digest 模式和 Full 模式使用 signtool 构造 PKCS#7，不受此问题影响。
+
+**诊断方法**：`osslsigncode verify <file>` 若输出 "Failed to extract a page hash" 即为此问题。
+
 ## 安全设计
 
 - **JWT**：HMAC-SHA256 自实现，含 `jti` 随机字段；重新颁发 Token 时旧 Token 立即失效
