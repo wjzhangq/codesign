@@ -410,7 +410,7 @@ func TestBuildSignedPKCS7_ASN1Structure(t *testing.T) {
 	fakeDigest := make([]byte, 32)
 	fakeRSASig := make([]byte, 256)
 
-	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, fakeRSASig)
+	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, fakeRSASig, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("BuildSignedPKCS7: %v", err)
 	}
@@ -568,5 +568,100 @@ func TestBuildUnsignedPKCS7_ASN1Structure(t *testing.T) {
 			signedDataSeq.Class, signedDataSeq.Tag)
 	} else {
 		t.Log("Unsigned PKCS#7 ASN.1 structure is correct")
+	}
+}
+
+// TestBuildSignedPKCS7_WithTimestamp 验证带时间戳的 PKCS#7 结构
+// 检查 SignerInfo 中 UnauthenticatedAttrs 包含 RFC 3161 countersign OID
+func TestBuildSignedPKCS7_WithTimestamp(t *testing.T) {
+	certDER := generateTestCert(t)
+	fakeDigest := make([]byte, 32)
+	fakeRSASig := make([]byte, 256)
+	// 构造一个最小的合法 ASN.1 SEQUENCE 作为 mock tsToken
+	fakeTsToken, _ := asn1.Marshal(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagSequence, IsCompound: true,
+		Bytes: []byte{0x02, 0x01, 0x00}, // INTEGER 0
+	})
+
+	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, fakeRSASig, time.Now(), fakeTsToken)
+	if err != nil {
+		t.Fatalf("BuildSignedPKCS7 with timestamp: %v", err)
+	}
+
+	// 解析到 SignedData 内部
+	var outer asn1.RawValue
+	rest, _ := asn1.Unmarshal(pkcs7DER, &outer)
+	_ = rest
+
+	// ContentInfo → [0] → SEQUENCE(SignedData)
+	var oid asn1.ObjectIdentifier
+	rest, _ = asn1.Unmarshal(outer.Bytes, &oid)
+	var explicit0 asn1.RawValue
+	rest, _ = asn1.Unmarshal(rest, &explicit0)
+	var signedDataSeq asn1.RawValue
+	_, _ = asn1.Unmarshal(explicit0.Bytes, &signedDataSeq)
+
+	// SignedData: version, digestAlgs, contentInfo, [0]certs, signerInfos
+	inner := signedDataSeq.Bytes
+	var version int
+	inner, _ = asn1.Unmarshal(inner, &version)
+	var digestAlgs asn1.RawValue
+	inner, _ = asn1.Unmarshal(inner, &digestAlgs)
+	var contentInfo asn1.RawValue
+	inner, _ = asn1.Unmarshal(inner, &contentInfo)
+	var certs asn1.RawValue
+	inner, _ = asn1.Unmarshal(inner, &certs)
+	// inner 现在是 SignerInfos SET
+	var signerInfosSet asn1.RawValue
+	_, _ = asn1.Unmarshal(inner, &signerInfosSet)
+
+	// 解析 SignerInfo SEQUENCE
+	var si asn1.RawValue
+	_, _ = asn1.Unmarshal(signerInfosSet.Bytes, &si)
+
+	// 遍历 SignerInfo 字段，找到 [1] UnauthenticatedAttrs
+	siInner := si.Bytes
+	foundUnauth := false
+	for len(siInner) > 0 {
+		var field asn1.RawValue
+		var err error
+		siInner, err = asn1.Unmarshal(siInner, &field)
+		if err != nil {
+			break
+		}
+		if field.Class == asn1.ClassContextSpecific && field.Tag == 1 {
+			foundUnauth = true
+			// 内部应该是 SEQUENCE { OID(1.3.6.1.4.1.311.3.3.1), SET { tsToken } }
+			var attrSeq asn1.RawValue
+			_, err := asn1.Unmarshal(field.Bytes, &attrSeq)
+			if err != nil {
+				t.Fatalf("unmarshal unauth attr SEQUENCE: %v", err)
+			}
+			if attrSeq.Tag != asn1.TagSequence {
+				t.Fatalf("unauth attr: expected SEQUENCE, got tag=%d", attrSeq.Tag)
+			}
+			var attrOID asn1.ObjectIdentifier
+			attrRest, err := asn1.Unmarshal(attrSeq.Bytes, &attrOID)
+			if err != nil {
+				t.Fatalf("unmarshal unauth attr OID: %v", err)
+			}
+			expectedOID := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
+			if !attrOID.Equal(expectedOID) {
+				t.Fatalf("unauth attr OID: got %v, want %v", attrOID, expectedOID)
+			}
+			// 后面应该是 SET
+			var valSet asn1.RawValue
+			_, err = asn1.Unmarshal(attrRest, &valSet)
+			if err != nil {
+				t.Fatalf("unmarshal unauth attr SET: %v", err)
+			}
+			if valSet.Tag != asn1.TagSet {
+				t.Fatalf("unauth attr value: expected SET, got tag=%d", valSet.Tag)
+			}
+			t.Logf("UnauthenticatedAttrs correctly contains RFC 3161 countersign (OID %v)", attrOID)
+		}
+	}
+	if !foundUnauth {
+		t.Fatal("SignerInfo missing UnauthenticatedAttrs [1] — timestamp not embedded")
 	}
 }

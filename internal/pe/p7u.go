@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"time"
 )
 
 // OID 定义 (Authenticode / PKCS#7 相关)
@@ -20,6 +21,8 @@ var (
 	oidContentType            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
 	oidSpcSpOpusInfo          = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 12}
 	oidMessageDigest          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
+	oidSigningTime            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
+	oidRFC3161CounterSign     = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
 )
 
 // BuildUnsignedPKCS7 构造 Authenticode unsigned PKCS#7 (.p7u)
@@ -180,7 +183,7 @@ func buildSpcIndirectDataContent(digest []byte) ([]byte, error) {
 
 func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
 	// 复用 buildAuthAttrsContent 构造 authenticated attributes
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +320,7 @@ func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 // BuildSignedPKCS7 构造已签名的 PKCS#7 (完整 Authenticode 签名)
 // 流程:
 //  1. 构造 SpcIndirectDataContent
-//  2. 构造 authenticatedAttributes（含 ContentType, SpcSpOpusInfo, MessageDigest）
+//  2. 构造 authenticatedAttributes（含 ContentType, SpcSpOpusInfo, MessageDigest, SigningTime）
 //  3. 将 authAttrs 的 DER (tag 改为 SET OF 0x31) 做 SHA-256 → authAttrsDigest
 //  4. 用传入的 rsaSignature (由 raw-sign 对 authAttrsDigest 签名得到) 填充 EncryptedDigest
 //  5. 组装完整 SignedData
@@ -326,7 +329,9 @@ func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 //   - digest:       Authenticode SHA-256 摘要 (32 bytes)
 //   - certDER:      签名证书 DER 编码
 //   - rsaSignature: RSA-PKCS1v15-SHA256 签名值 (big-endian)
-func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte) ([]byte, error) {
+//   - signingTime:  签名时间
+//   - tsToken:      RFC 3161 时间戳令牌 (可为 nil)
+func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("parse cert: %w", err)
@@ -339,7 +344,7 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte) ([]byt
 	}
 
 	// 2. 构造 SignerInfo（包含签名值）
-	signedSignerInfo, err := buildSignedSignerInfo(cert, indirectData, rsaSignature)
+	signedSignerInfo, err := buildSignedSignerInfo(cert, indirectData, rsaSignature, signingTime, tsToken)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +377,7 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte) ([]byt
 //
 // PKCS#7 规范要求: 签名时 authenticatedAttributes 使用 SET OF (tag 0x31) 编码,
 // 而非 SignerInfo 中的 IMPLICIT [0] (tag 0xA0)
-func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) {
+func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte, signingTime time.Time) (string, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return "", fmt.Errorf("parse cert: %w", err)
@@ -385,7 +390,7 @@ func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) 
 	}
 
 	// 构造 authAttrs 内容
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, signingTime)
 	if err != nil {
 		return "", err
 	}
@@ -407,8 +412,9 @@ func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) 
 	return fmt.Sprintf("%x", h), nil
 }
 
-// buildAuthAttrsContent 构造 authenticatedAttributes 的内容部分（三个 attribute 拼接）
-func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
+// buildAuthAttrsContent 构造 authenticatedAttributes 的内容部分
+// signingTime 非零时会追加 signingTime attribute（raw 模式使用）
+func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte, signingTime time.Time) ([]byte, error) {
 	// 1. ContentType = SpcIndirectDataContent
 	contentTypeAttr, err := buildAttr(oidContentType, oidSpcIndirectDataContent)
 	if err != nil {
@@ -428,12 +434,23 @@ func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte) ([]byte,
 		return nil, err
 	}
 
-	return append(append(contentTypeAttr, opusInfoAttr...), msgDigestAttr...), nil
+	attrs := append(append(contentTypeAttr, opusInfoAttr...), msgDigestAttr...)
+
+	// 4. SigningTime（仅 raw 模式）
+	if !signingTime.IsZero() {
+		signingTimeAttr, err := buildAttr(oidSigningTime, signingTime.UTC())
+		if err != nil {
+			return nil, err
+		}
+		attrs = append(attrs, signingTimeAttr...)
+	}
+
+	return attrs, nil
 }
 
 // buildSignedSignerInfo 构造包含签名值的 SignerInfo
-func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSignature []byte) ([]byte, error) {
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
+func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, signingTime)
 	if err != nil {
 		return nil, err
 	}
@@ -461,6 +478,20 @@ func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSigna
 		EncryptedDigest: rsaSignature, // 已签名的值
 	}
 
+	// RFC 3161 时间戳反签名
+	if len(tsToken) > 0 {
+		unauthAttr, err := buildTimestampUnauthAttr(tsToken)
+		if err != nil {
+			return nil, fmt.Errorf("build timestamp unauth attr: %w", err)
+		}
+		si.UnauthenticatedAttrs = asn1.RawValue{
+			Class:      asn1.ClassContextSpecific,
+			Tag:        1,
+			IsCompound: true,
+			Bytes:      unauthAttr,
+		}
+	}
+
 	return asn1.Marshal(si)
 }
 
@@ -486,6 +517,31 @@ func buildOpusInfoAttr() ([]byte, error) {
 		return nil, err
 	}
 	oidDER, err := asn1.Marshal(oidSpcSpOpusInfo)
+	if err != nil {
+		return nil, err
+	}
+	attrSeq := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      append(oidDER, valSetDER...),
+	}
+	return asn1.Marshal(attrSeq)
+}
+
+// buildTimestampUnauthAttr 构造 UnauthenticatedAttrs 中的 RFC 3161 时间戳属性内容
+func buildTimestampUnauthAttr(tsToken []byte) ([]byte, error) {
+	oidDER, err := asn1.Marshal(oidRFC3161CounterSign)
+	if err != nil {
+		return nil, err
+	}
+	valSet := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSet,
+		IsCompound: true,
+		Bytes:      tsToken,
+	}
+	valSetDER, err := asn1.Marshal(valSet)
 	if err != nil {
 		return nil, err
 	}

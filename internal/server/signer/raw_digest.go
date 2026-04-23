@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"time"
 
 	"codesign/internal/pe"
 )
@@ -51,8 +52,10 @@ func (s *Signer) RawDigestSignFromBase64(ctx context.Context, filename, digB64 s
 }
 
 func (s *Signer) doRawDigestSign(ctx context.Context, req *RawDigestSignRequest) ([]byte, error) {
-	// Step 1: 计算 authenticatedAttributes 的 SHA-256 摘要
-	authAttrsDigestHex, err := pe.AuthAttrsDigest(req.DigBytes, req.CertDER)
+	signingTime := time.Now().UTC()
+
+	// Step 1: 计算 authenticatedAttributes 的 SHA-256 摘要（含 signingTime）
+	authAttrsDigestHex, err := pe.AuthAttrsDigest(req.DigBytes, req.CertDER, signingTime)
 	if err != nil {
 		return nil, fmt.Errorf("compute authAttrs digest: %w", err)
 	}
@@ -69,13 +72,22 @@ func (s *Signer) doRawDigestSign(ctx context.Context, req *RawDigestSignRequest)
 		return nil, fmt.Errorf("decode RSA signature: %w", err)
 	}
 
-	// Step 4: 构造完整的已签名 PKCS#7
-	pkcs7DER, err := pe.BuildSignedPKCS7(req.DigBytes, req.CertDER, rsaSignature)
+	// Step 4: 请求 RFC 3161 时间戳
+	var tsToken []byte
+	if s.cfg.TimestampURL != "" {
+		tsToken, err = pe.RequestTimestamp(ctx, rsaSignature, s.cfg.TimestampURL)
+		if err != nil {
+			return nil, fmt.Errorf("timestamp: %w", err)
+		}
+	}
+
+	// Step 5: 构造完整的已签名 PKCS#7（含 signingTime 和时间戳）
+	pkcs7DER, err := pe.BuildSignedPKCS7(req.DigBytes, req.CertDER, rsaSignature, signingTime, tsToken)
 	if err != nil {
 		return nil, fmt.Errorf("build signed PKCS7: %w", err)
 	}
 
-	// Step 5: 包装为 WIN_CERTIFICATE
+	// Step 6: 包装为 WIN_CERTIFICATE
 	certTable := pe.BuildWinCertificate(pkcs7DER)
 
 	return certTable, nil
