@@ -144,14 +144,14 @@ func buildSpcIndirectDataContent(digest []byte) ([]byte, error) {
 	// file 字段是 SpcLink，Authenticode 规范要求必须存在。
 	// 使用 file → SpcString(unicode) 指向空 BMPString，
 	// 与 signtool 生成的签名一致：
-	//   [0] CONSTRUCTED {            -- SpcPeImageData.file
-	//     [2] CONSTRUCTED {          -- SpcLink CHOICE: file (SpcString)
-	//       [0] PRIMITIVE "\x00\x00" -- SpcString CHOICE: unicode (BMPString)
+	//   [0] CONSTRUCTED {          -- SpcPeImageData.file
+	//     [2] CONSTRUCTED {        -- SpcLink CHOICE: file (SpcString)
+	//       [0] PRIMITIVE (empty)  -- SpcString CHOICE: unicode (empty BMPString)
 	//     }
 	//   }
-	spcLinkFileContent := []byte{0xa2, 0x04, 0x80, 0x02, 0x00, 0x00}
+	spcLinkFileContent := []byte{0xa2, 0x02, 0x80, 0x00}
 	peImageData := spcPeImageData{
-		Flags: asn1.BitString{Bytes: []byte{0}, BitLength: 0},
+		Flags: asn1.BitString{Bytes: nil, BitLength: 0},
 		File: asn1.RawValue{
 			Class:      asn1.ClassContextSpecific,
 			Tag:        0,
@@ -289,6 +289,67 @@ func buildSignedData(cert *x509.Certificate, indirectData []byte, signerInfoDER 
 	return signedDataBytes, nil
 }
 
+func buildSignedDataMultiCert(certDERs [][]byte, indirectData []byte, signerInfoDER []byte) ([]byte, error) {
+	contentInfo := struct {
+		ContentType asn1.ObjectIdentifier
+		Content     asn1.RawValue `asn1:"explicit,tag:0"`
+	}{
+		ContentType: oidSpcIndirectDataContent,
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: indirectData},
+	}
+	contentInfoDER, err := asn1.Marshal(contentInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	digestAlgDER, err := asn1.Marshal(algorithmIdentifier{
+		Algorithm:  oidSHA256,
+		Parameters: asn1.RawValue{Tag: asn1.TagNull},
+	})
+	if err != nil {
+		return nil, err
+	}
+	digestAlgSetDER, err := asn1.Marshal(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagSet, IsCompound: true,
+		Bytes: digestAlgDER,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var allCertsBytes []byte
+	for _, der := range certDERs {
+		allCertsBytes = append(allCertsBytes, der...)
+	}
+	certSetDER, err := asn1.Marshal(asn1.RawValue{
+		Class: 2, Tag: 0, IsCompound: true,
+		Bytes: allCertsBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	signerInfoSetDER, err := asn1.Marshal(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagSet, IsCompound: true,
+		Bytes: signerInfoDER,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	versionDER, err := asn1.Marshal(1)
+	if err != nil {
+		return nil, err
+	}
+
+	signedDataBytes := append(versionDER, digestAlgSetDER...)
+	signedDataBytes = append(signedDataBytes, contentInfoDER...)
+	signedDataBytes = append(signedDataBytes, certSetDER...)
+	signedDataBytes = append(signedDataBytes, signerInfoSetDER...)
+
+	return signedDataBytes, nil
+}
+
 func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 	valDER, err := asn1.Marshal(value)
 	if err != nil {
@@ -318,20 +379,15 @@ func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 }
 
 // BuildSignedPKCS7 构造已签名的 PKCS#7 (完整 Authenticode 签名)
-// 流程:
-//  1. 构造 SpcIndirectDataContent
-//  2. 构造 authenticatedAttributes（含 ContentType, SpcSpOpusInfo, MessageDigest, SigningTime）
-//  3. 将 authAttrs 的 DER (tag 改为 SET OF 0x31) 做 SHA-256 → authAttrsDigest
-//  4. 用传入的 rsaSignature (由 raw-sign 对 authAttrsDigest 签名得到) 填充 EncryptedDigest
-//  5. 组装完整 SignedData
 //
 // 参数:
 //   - digest:       Authenticode SHA-256 摘要 (32 bytes)
 //   - certDER:      签名证书 DER 编码
+//   - chainDERs:    证书链 DER 编码列表（中间 CA 等，可为 nil）
 //   - rsaSignature: RSA-PKCS1v15-SHA256 签名值 (big-endian)
 //   - signingTime:  签名时间
 //   - tsToken:      RFC 3161 时间戳令牌 (可为 nil)
-func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
+func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("parse cert: %w", err)
@@ -350,7 +406,9 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, rsaSignature []byte, signin
 	}
 
 	// 3. 构造 SignedData
-	signedData, err := buildSignedData(cert, indirectData, signedSignerInfo)
+	allCertDERs := [][]byte{certDER}
+	allCertDERs = append(allCertDERs, chainDERs...)
+	signedData, err := buildSignedDataMultiCert(allCertDERs, indirectData, signedSignerInfo)
 	if err != nil {
 		return nil, err
 	}

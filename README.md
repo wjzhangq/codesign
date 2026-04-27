@@ -144,6 +144,7 @@ codesign/
 | SafeNet 驱动 | SafeNet Authentication Client 10.x |
 | eToken | 已插入 USB，已初始化，已导入代码签名证书 |
 | 证书文件 | `.cer` 格式 DER 编码公钥证书 |
+| 证书链 | 中间 CA 证书（Raw 模式必需，见下方说明） |
 
 > **提示**: 如果只使用 Raw 模式签名 PE 文件 + XML 签名，可以不安装 signtool / Windows SDK，只需部署 `raw-sign.exe`。
 
@@ -196,6 +197,44 @@ digest_mode   = false    # 首次部署先设为 false，验证后再改为 true
 ```
 
 > **安全提示**: `config.ini` 含 eToken 密码，文件权限应设为仅 owner 可读。
+
+**1.1 配置证书链（Raw 模式必需）**
+
+Raw 模式由服务端自行构造 PKCS#7，需要将中间 CA 证书嵌入签名中，否则 Windows 无法验证证书链。
+
+**获取中间 CA 证书**
+
+以 DigiCert 为例，从官方证书仓库下载：
+
+1. 打开 https://www.digicert.com/kb/digicert-root-certificates.htm
+2. 搜索签名证书的 Issuer 名称（例如 `DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1`）
+3. 下载对应的 `.crt` 或 `.cer` 文件（DER 格式）
+4. 如需交叉签名根证书（`DigiCert Trusted Root G4`），一并下载
+
+也可以从已有的正确签名文件中导出：右键 → 属性 → 数字签名 → 详细信息 → 查看证书 → 证书路径 → 逐级选中中间 CA → 查看证书 → 详细信息 → 复制到文件。
+
+**配置方式（二选一，可同时使用）**
+
+方式 A — 内嵌到 INI（推荐，单文件部署）：
+
+```ini
+# 多个证书用分号分隔，每个是完整的 base64 DER 编码（无换行）
+cert_chain = MIIGsDCC...中间CA的base64...;MIIFjTCC...根CA的base64...
+```
+
+将 `.cer` 文件转为 base64：`certutil -encode ca.cer /dev/stdout | findstr /v CERTIFICATE` 或 PowerShell：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("ca.cer"))
+```
+
+方式 B — 目录方式：
+
+```ini
+cert_chain_dir = C:\certs\chain
+```
+
+将 `.cer` / `.crt` / `.pem` / `.der` 文件放入该目录，服务端启动时自动加载。
 
 **2. 验证 Digest 模式可用性**
 
@@ -507,32 +546,20 @@ go test ./...
 
 此修复影响所有三种签名模式（Raw / Digest / Full），对文件大小已是 8 字节倍数的文件无影响。
 
-### Raw 模式签名后 Windows 提示"主题中没有签名" (SpcPeImageData 缺少 File 字段)
+### Raw 模式签名后 Windows 提示"主题中没有签名"
 
-**现象**：使用 Raw 模式（`--mode raw`）签名后，Windows 右键属性可以看到签名，但点击签名详情后提示"主题中没有签名"。`osslsigncode verify` 报告 "Failed to extract a page hash"。Digest 模式和 Full 模式（走 signtool）签名正常。
+**现象**：使用 Raw 模式（`--mode raw`）签名后，Windows 属性中可以看到时间戳，但提示"主题中没有签名"。`Get-AuthenticodeSignature` 返回 `Status: NotSigned`。
 
-**根因**：`internal/pe/p7u.go` 中 `buildSpcIndirectDataContent()` 构造的 `SpcPeImageData` 结构缺少 `File`（SpcLink）字段。Authenticode 规范要求 `SpcPeImageData` 必须包含 `flags`（BitString）和 `file`（SpcLink）两个字段，而原实现只编码了 `flags`：
+**根因**（两个问题叠加）：
 
-```
-修复前: SEQUENCE { BIT STRING (03 02 00 00) }  — 仅 flags，6 bytes
-修复后: SEQUENCE { BIT STRING (03 02 00 00), [0] { [2] { [0] "\x00\x00" } } }  — flags + file，14 bytes
-```
+1. **SpcPeImageData 编码不一致**：`BIT_STRING` 多了一个零字节（`03 02 00 00` → 应为 `03 01 00`），`SpcString` 多了两个零字节（`80 02 00 00` → 应为 `80 00`），与 signtool 生成的编码不一致。
+2. **缺少证书链**：PKCS#7 中只包含签名证书，缺少中间 CA 证书，Windows 无法构建完整的证书信任链。
 
-signtool 生成的签名始终包含 `file` 字段指向一个空的 BMPString（`\x00\x00`），Windows 验签器依赖该字段判断 SpcIndirectDataContent 的完整性。
-
-**修复**：`internal/pe/p7u.go` 的 `buildSpcIndirectDataContent()` 新增 `File` 字段，使用手工构造的 SpcLink 字节序列 `a0 06 a2 04 80 02 00 00`，与 signtool 输出一致：
-
-```
-[0] CONSTRUCTED {            -- SpcPeImageData.file
-  [2] CONSTRUCTED {          -- SpcLink CHOICE: file (SpcString)
-    [0] PRIMITIVE "\x00\x00" -- SpcString CHOICE: unicode (BMPString)
-  }
-}
-```
-
-**影响**：仅影响 Raw 模式（服务端 Go 代码自行构造 PKCS#7）。修复后需重新编译服务端并重新签名受影响的文件。Digest 模式和 Full 模式使用 signtool 构造 PKCS#7，不受此问题影响。
-
-**诊断方法**：`osslsigncode verify <file>` 若输出 "Failed to extract a page hash" 即为此问题。
+**修复**：
+- `pe/p7u.go`：修正 `BitString` 编码（`Bytes: nil`）和 `spcLinkFileContent`（`{0xa2, 0x02, 0x80, 0x00}`），与 signtool 输出一致
+- `pe/p7u.go`：`BuildSignedPKCS7` 新增 `chainDERs` 参数，支持在 PKCS#7 中嵌入多个证书
+- `server/config`：新增 `cert_chain`（INI 内嵌 base64）和 `cert_chain_dir`（目录加载）两种证书链配置方式
+- `server/handler/sign_raw.go`：加载证书链并传递给签名流程
 
 ## 安全设计
 

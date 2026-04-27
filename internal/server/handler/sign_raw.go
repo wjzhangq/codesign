@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"codesign/internal/server/config"
@@ -34,6 +36,8 @@ func SignRawDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc
 			writeError(w, http.StatusInternalServerError, "failed to read certificate: "+certErr.Error())
 		}
 	}
+
+	chainDERs := append(cfg.CertChainDERs, loadChainCerts(cfg.CertChainDir)...)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -70,7 +74,7 @@ func SignRawDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc
 		}
 
 		// 调用 RawDigestSign
-		certTable, err := s.RawDigestSignFromBase64(r.Context(), req.Filename, req.Dig, certDER)
+		certTable, err := s.RawDigestSignFromBase64(r.Context(), req.Filename, req.Dig, certDER, chainDERs)
 		if err != nil {
 			if isTimeoutOrCanceled(err) || r.Context().Err() != nil {
 				slog.Info("sign/raw timeout",
@@ -96,4 +100,68 @@ func SignRawDigestHandler(cfg *config.Config, s *signer.Signer) http.HandlerFunc
 			CertificateTable: base64.StdEncoding.EncodeToString(certTable),
 		})
 	}
+}
+
+// loadChainCerts 从目录加载证书链（.cer / .crt / .pem 文件，DER 或 PEM 格式）
+func loadChainCerts(dir string) [][]byte {
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Warn("load cert chain dir failed", "dir", dir, "error", err)
+		return nil
+	}
+	var certs [][]byte
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ext != ".cer" && ext != ".crt" && ext != ".pem" && ext != ".der" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			slog.Warn("load chain cert failed", "file", e.Name(), "error", err)
+			continue
+		}
+		// PEM 格式检测：尝试提取 DER
+		if len(data) > 0 && data[0] != 0x30 {
+			// 可能是 PEM，尝试解码
+			if derBytes := decodePEM(data); derBytes != nil {
+				certs = append(certs, derBytes)
+				slog.Info("loaded chain cert (PEM)", "file", e.Name())
+				continue
+			}
+		}
+		certs = append(certs, data)
+		slog.Info("loaded chain cert (DER)", "file", e.Name())
+	}
+	return certs
+}
+
+// decodePEM 从 PEM 数据中提取第一个 CERTIFICATE block 的 DER 字节
+func decodePEM(data []byte) []byte {
+	// 简单查找 -----BEGIN CERTIFICATE-----
+	const begin = "-----BEGIN CERTIFICATE-----"
+	const end = "-----END CERTIFICATE-----"
+	s := string(data)
+	idx := strings.Index(s, begin)
+	if idx < 0 {
+		return nil
+	}
+	s = s[idx+len(begin):]
+	idx = strings.Index(s, end)
+	if idx < 0 {
+		return nil
+	}
+	b64 := strings.ReplaceAll(s[:idx], "\n", "")
+	b64 = strings.ReplaceAll(b64, "\r", "")
+	b64 = strings.TrimSpace(b64)
+	der, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil
+	}
+	return der
 }

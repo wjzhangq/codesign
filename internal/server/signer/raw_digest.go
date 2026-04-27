@@ -12,9 +12,10 @@ import (
 
 // RawDigestSignRequest Raw 模式签名请求
 type RawDigestSignRequest struct {
-	Filename string
-	DigBytes []byte // Authenticode digest (32 bytes SHA-256)
-	CertDER  []byte // 签名证书 DER 编码
+	Filename  string
+	DigBytes  []byte   // Authenticode digest (32 bytes SHA-256)
+	CertDER   []byte   // 签名证书 DER 编码
+	ChainDERs [][]byte // 证书链 DER 编码列表（中间 CA 等）
 }
 
 // RawDigestSign 使用 raw-sign.exe 完成 Authenticode 签名，不依赖 signtool
@@ -36,7 +37,7 @@ func (s *Signer) RawDigestSign(ctx context.Context, req *RawDigestSignRequest) (
 }
 
 // RawDigestSignFromBase64 从 base64 编码的 digest 进行签名
-func (s *Signer) RawDigestSignFromBase64(ctx context.Context, filename, digB64 string, certDER []byte) ([]byte, error) {
+func (s *Signer) RawDigestSignFromBase64(ctx context.Context, filename, digB64 string, certDER []byte, chainDERs [][]byte) ([]byte, error) {
 	digBytes, err := base64.StdEncoding.DecodeString(digB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode dig base64: %w", err)
@@ -45,9 +46,10 @@ func (s *Signer) RawDigestSignFromBase64(ctx context.Context, filename, digB64 s
 		return nil, fmt.Errorf("invalid digest length: expected 32 bytes, got %d", len(digBytes))
 	}
 	return s.RawDigestSign(ctx, &RawDigestSignRequest{
-		Filename: filename,
-		DigBytes: digBytes,
-		CertDER:  certDER,
+		Filename:  filename,
+		DigBytes:  digBytes,
+		CertDER:   certDER,
+		ChainDERs: chainDERs,
 	})
 }
 
@@ -82,7 +84,7 @@ func (s *Signer) doRawDigestSign(ctx context.Context, req *RawDigestSignRequest)
 	}
 
 	// Step 5: 构造完整的已签名 PKCS#7（含 signingTime 和时间戳）
-	pkcs7DER, err := pe.BuildSignedPKCS7(req.DigBytes, req.CertDER, rsaSignature, signingTime, tsToken)
+	pkcs7DER, err := pe.BuildSignedPKCS7(req.DigBytes, req.CertDER, req.ChainDERs, rsaSignature, signingTime, tsToken)
 	if err != nil {
 		return nil, fmt.Errorf("build signed PKCS7: %w", err)
 	}

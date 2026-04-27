@@ -138,15 +138,16 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", c.server+"/api/sign", bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 
-	// SignDigest 请求体为内存 buffer，可安全重试
-	// 超时由 doWithRetry 内部 defaultTimeout 控制
 	resp, err := c.doWithRetry(req, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("sign digest: %w", err)
@@ -175,15 +176,9 @@ func (c *Client) SignDigest(filename, digB64, p7uB64 string, info *pe.PEInfo) (*
 
 // doWithRetry 执行 HTTP 请求，在网络级错误时最多重试 1 次（Gap-4）
 // bodyBuf 是可重放的请求体（bytes.Reader 支持 Seek）
-// 如果请求没有关联 context 超时，会自动加上 defaultTimeout
+// 调用方必须通过 req 的 context 设置超时，doWithRetry 不再自行添加超时，
+// 避免 defer cancel() 在返回后关闭连接导致调用方读取 resp.Body 时 context canceled。
 func (c *Client) doWithRetry(req *http.Request, bodyBuf *bytes.Reader) (*http.Response, error) {
-	// 如果请求没有设置 deadline，自动加上默认超时
-	if _, ok := req.Context().Deadline(); !ok {
-		ctx, cancel := context.WithTimeout(req.Context(), defaultTimeout)
-		defer cancel()
-		req = req.WithContext(ctx)
-	}
-
 	resp, err := c.httpClient.Do(req)
 	if err == nil {
 		return resp, nil
@@ -217,7 +212,10 @@ func (c *Client) SignRawDigest(filename, digB64 string) (*SignResponse, error) {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", c.server+"/api/sign/raw", bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign/raw", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +266,10 @@ func (c *Client) RawSign(digestHex, algo string) (*RawSignResponse, error) {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", c.server+"/api/raw-sign", bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/raw-sign", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
