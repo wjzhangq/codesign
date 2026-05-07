@@ -46,7 +46,7 @@ func TestVerifyXML_Valid(t *testing.T) {
   <quantity>100</quantity>
 </order>`)
 
-	signed, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	signed, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("sign failed: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestVerifyXML_TamperedContent(t *testing.T) {
   <quantity>100</quantity>
 </order>`)
 
-	signed, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	signed, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("sign failed: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestVerifyXML_TamperedSignatureValue(t *testing.T) {
 		fakeSig, _ := rsa.SignPKCS1v15(rand.Reader, badKey, crypto.SHA256, make([]byte, 32))
 		return base64.StdEncoding.EncodeToString(fakeSig), nil
 	}
-	signedBad, err := SignXML(xmlInput, certDER, badSignFunc)
+	signedBad, err := SignXML(xmlInput, certDER, nil, badSignFunc)
 	if err != nil {
 		t.Fatalf("sign with bad key failed: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestVerifyXML_WithNamespaces(t *testing.T) {
   <ns:quantity>100</ns:quantity>
 </ns:order>`)
 
-	signed, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	signed, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("sign failed: %v", err)
 	}

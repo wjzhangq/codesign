@@ -90,6 +90,7 @@ func cmdServe(cfgPath string) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/health", handler.HealthHandler(cfg))
 	mux.Handle("GET /api/cert", jwtMw(handler.CertHandler(cfg)))
+	mux.Handle("GET /api/cert-chain", jwtMw(handler.CertChainHandler(cfg)))
 	mux.Handle("POST /api/sign", jwtMw(handler.SignDigestHandler(cfg, s)))
 	mux.Handle("POST /api/sign/full", jwtMw(handler.SignFullHandler(s)))
 	mux.Handle("POST /api/sign/raw", jwtMw(handler.SignRawDigestHandler(cfg, s)))

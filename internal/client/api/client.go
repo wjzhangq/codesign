@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -100,6 +101,47 @@ func (c *Client) GetPublicCert() ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+// GetCertChain 获取服务端证书链 (DER 格式列表)
+func (c *Client) GetCertChain() ([][]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", c.server+"/api/cert-chain", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get cert-chain: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get cert-chain: server returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Chain []string `json:"chain"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode cert-chain response: %w", err)
+	}
+
+	var chainDERs [][]byte
+	for _, b64 := range result.Chain {
+		der, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("decode chain cert: %w", err)
+		}
+		chainDERs = append(chainDERs, der)
+	}
+	return chainDERs, nil
 }
 
 // SignDigestRequest Digest 签名请求

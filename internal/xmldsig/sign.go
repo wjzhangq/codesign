@@ -14,10 +14,11 @@ import (
 // 参数:
 //   - xmlBytes:  原始 XML 文档字节
 //   - certDER:   公钥证书 DER 编码
+//   - chainDERs: 证书链 DER 编码列表（中间 CA 等，可为 nil）
 //   - signFunc:  远程签名回调，接收 hex digest，返回 base64 签名值
 //
 // 返回签名后的完整 XML 文档字节
-func SignXML(xmlBytes []byte, certDER []byte, signFunc func(digestHex string) (string, error)) ([]byte, error) {
+func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(digestHex string) (string, error)) ([]byte, error) {
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(xmlBytes); err != nil {
 		return nil, fmt.Errorf("parse XML: %w", err)
@@ -34,8 +35,8 @@ func SignXML(xmlBytes []byte, certDER []byte, signFunc func(digestHex string) (s
 	// 1a. enveloped-signature transform: 移除已有签名
 	removeExistingSignatures(root)
 
-	// 1b. Exclusive C14N（使用副本，不修改 root）
-	contentC14N, err := exclusiveC14NCopy(root)
+	// 1b. Inclusive C14N（使用副本，不修改 root）
+	contentC14N, err := inclusiveC14NCopy(root)
 	if err != nil {
 		return nil, fmt.Errorf("c14n content: %w", err)
 	}
@@ -50,8 +51,8 @@ func SignXML(xmlBytes []byte, certDER []byte, signFunc func(digestHex string) (s
 
 	signedInfoElem := buildSignedInfo(digestValue)
 
-	// 2a. Exclusive C14N on SignedInfo（使用副本）
-	signedInfoC14N, err := exclusiveC14NCopy(signedInfoElem)
+	// 2a. Inclusive C14N on SignedInfo（使用副本）
+	signedInfoC14N, err := inclusiveC14NCopy(signedInfoElem)
 	if err != nil {
 		return nil, fmt.Errorf("c14n signedinfo: %w", err)
 	}
@@ -73,7 +74,7 @@ func SignXML(xmlBytes []byte, certDER []byte, signFunc func(digestHex string) (s
 	// Step 4: 组装 Signature，嵌入文档
 	// ═══════════════════════════════════════
 
-	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER)
+	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER, chainDERs)
 	root.AddChild(sigElem)
 
 	output, err := doc.WriteToBytes()

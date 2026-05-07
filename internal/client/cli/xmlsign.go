@@ -127,10 +127,13 @@ func XmlSignCommand() *urfavecli.Command {
 				return fmt.Errorf("get server cert: %w", err)
 			}
 
+			// 获取证书链（中间 CA 等）
+			chainDERs, _ := client.GetCertChain()
+
 			hasError := false
 			for _, filePath := range files {
 				outPath := resolveOutputPath(filePath, outputPath)
-				if err := xmlSignFile(client, filePath, outPath, certDER); err != nil {
+				if err := xmlSignFile(client, filePath, outPath, certDER, chainDERs); err != nil {
 					if len(files) > 1 {
 						fmt.Fprintf(os.Stderr, "  ERROR %s: %v\n", filePath, err)
 						hasError = true
@@ -159,7 +162,7 @@ func resolveOutputPath(inputPath, outputPath string) string {
 	return outputPath
 }
 
-func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byte) error {
+func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byte, chainDERs [][]byte) error {
 	start := time.Now()
 
 	fmt.Printf("\n  %s\n", filepath.Base(inputPath))
@@ -185,7 +188,7 @@ func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byt
 	}
 
 	// 执行 XMLDSIG 签名
-	signedXML, err := xmldsig.SignXML(xmlBytes, certDER, signFunc)
+	signedXML, err := xmldsig.SignXML(xmlBytes, certDER, chainDERs, signFunc)
 	if err != nil {
 		return fmt.Errorf("xmldsig sign: %w", err)
 	}

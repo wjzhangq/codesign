@@ -41,7 +41,7 @@ func TestSignXML_Structure(t *testing.T) {
   <quantity>100</quantity>
 </order>`)
 
-	out, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	out, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("SignXML failed: %v", err)
 	}
@@ -53,38 +53,37 @@ func TestSignXML_Structure(t *testing.T) {
 	}
 	root := doc.Root()
 
-	// 验证 <ds:Signature> 存在
-	sig := root.FindElement("//ds:Signature")
+	// 验证 <Signature> 存在
+	sig := root.FindElement("//Signature")
 	if sig == nil {
-		// 尝试无前缀
-		sig = root.FindElement("//Signature")
+		sig = root.FindElement("//ds:Signature")
 	}
 	if sig == nil {
-		t.Fatal("ds:Signature element not found in output")
+		t.Fatal("Signature element not found in output")
 	}
 
 	// 验证 SignatureValue 非空
-	sv := sig.FindElement(".//ds:SignatureValue")
+	sv := sig.FindElement(".//SignatureValue")
 	if sv == nil {
-		sv = sig.FindElement(".//SignatureValue")
+		sv = sig.FindElement(".//ds:SignatureValue")
 	}
 	if sv == nil || strings.TrimSpace(sv.Text()) == "" {
 		t.Fatal("SignatureValue is missing or empty")
 	}
 
 	// 验证 DigestValue 非空
-	dv := sig.FindElement(".//ds:DigestValue")
+	dv := sig.FindElement(".//DigestValue")
 	if dv == nil {
-		dv = sig.FindElement(".//DigestValue")
+		dv = sig.FindElement(".//ds:DigestValue")
 	}
 	if dv == nil || strings.TrimSpace(dv.Text()) == "" {
 		t.Fatal("DigestValue is missing or empty")
 	}
 
 	// 验证 X509Certificate 非空
-	cert := sig.FindElement(".//ds:X509Certificate")
+	cert := sig.FindElement(".//X509Certificate")
 	if cert == nil {
-		cert = sig.FindElement(".//X509Certificate")
+		cert = sig.FindElement(".//ds:X509Certificate")
 	}
 	if cert == nil || strings.TrimSpace(cert.Text()) == "" {
 		t.Fatal("X509Certificate is missing or empty")
@@ -104,14 +103,14 @@ func TestSignXML_Idempotent(t *testing.T) {
 </order>`)
 
 	// 第一次签名
-	signed1, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	signed1, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("first sign failed: %v", err)
 	}
 
 	// 第二次签名（对已签名 XML 重签）
 	key2, _ := rsa.GenerateKey(rand.Reader, 2048)
-	signed2, err := SignXML(signed1, certDER, mockSignFunc(key2))
+	signed2, err := SignXML(signed1, certDER, nil, mockSignFunc(key2))
 	if err != nil {
 		t.Fatalf("second sign failed: %v", err)
 	}
@@ -122,9 +121,9 @@ func TestSignXML_Idempotent(t *testing.T) {
 		t.Fatalf("parse re-signed XML: %v", err)
 	}
 	root := doc.Root()
-	sigs := root.FindElements("//ds:Signature")
+	sigs := root.FindElements("//Signature")
 	if len(sigs) == 0 {
-		sigs = root.FindElements("//Signature")
+		sigs = root.FindElements("//ds:Signature")
 	}
 	// 应该只有 1 个签名（旧签名被移除，新签名被添加）
 	if len(sigs) != 1 {
@@ -145,7 +144,7 @@ func TestSignXML_WithNamespaces(t *testing.T) {
   <ns:quantity>100</ns:quantity>
 </ns:order>`)
 
-	out, err := SignXML(xmlInput, certDER, mockSignFunc(key))
+	out, err := SignXML(xmlInput, certDER, nil, mockSignFunc(key))
 	if err != nil {
 		t.Fatalf("SignXML with namespaces failed: %v", err)
 	}
@@ -161,7 +160,7 @@ func TestSignXML_WithNamespaces(t *testing.T) {
 
 func TestSignXML_EmptyXML(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	_, err := SignXML([]byte("not xml"), []byte("cert"), mockSignFunc(key))
+	_, err := SignXML([]byte("not xml"), []byte("cert"), nil, mockSignFunc(key))
 	if err == nil {
 		t.Fatal("expected error for invalid XML input")
 	}
@@ -169,7 +168,7 @@ func TestSignXML_EmptyXML(t *testing.T) {
 
 func TestSignXML_NoRoot(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	_, err := SignXML([]byte(`<?xml version="1.0"?>`), []byte("cert"), mockSignFunc(key))
+	_, err := SignXML([]byte(`<?xml version="1.0"?>`), []byte("cert"), nil, mockSignFunc(key))
 	if err == nil {
 		t.Fatal("expected error for XML with no root element")
 	}

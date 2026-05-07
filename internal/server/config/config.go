@@ -1,9 +1,7 @@
 package config
 
 import (
-	"encoding/base64"
 	"fmt"
-	"strings"
 	"time"
 
 	"gopkg.in/ini.v1"
@@ -22,8 +20,6 @@ type Config struct {
 	SigntoolPath  string
 	RawSignPath   string
 	CertPath      string
-	CertChainDir  string   // 可选：包含中间 CA 证书的目录
-	CertChainDERs [][]byte // 可选：内嵌的证书链 DER（从 cert_chain 解析）
 	CSPName       string
 	CSPKey        string
 	TimestampURL  string
@@ -62,8 +58,6 @@ func Load(path string) *Config {
 	cfg.SigntoolPath = mustString(signSec, "signtool_path")
 	cfg.RawSignPath = signSec.Key("raw_sign_path").String()
 	cfg.CertPath = mustString(signSec, "cert_path")
-	cfg.CertChainDir = signSec.Key("cert_chain_dir").String()
-	cfg.CertChainDERs = parseCertChain(signSec.Key("cert_chain").String())
 	cfg.CSPName = mustString(signSec, "csp_name")
 	cfg.CSPKey = mustString(signSec, "csp_key")
 	cfg.TimestampURL = mustString(signSec, "timestamp_url")
@@ -72,27 +66,6 @@ func Load(path string) *Config {
 	cfg.DigestMode = signSec.Key("digest_mode").MustBool(false)
 
 	return cfg
-}
-
-// parseCertChain 解析分号分隔的 base64 DER 证书列表
-func parseCertChain(raw string) [][]byte {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	var certs [][]byte
-	for _, part := range strings.Split(raw, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		der, err := base64.StdEncoding.DecodeString(part)
-		if err != nil {
-			panic(fmt.Sprintf("invalid base64 in cert_chain: %v", err))
-		}
-		certs = append(certs, der)
-	}
-	return certs
 }
 
 func mustString(sec *ini.Section, key string) string {
