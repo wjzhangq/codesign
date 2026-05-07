@@ -564,6 +564,9 @@ go test ./...
 4. **多余的 signingTime 属性**：authenticatedAttributes 中包含了 `signingTime`，signtool 不在主签名中包含此属性（仅在时间戳反签名中），导致 authAttrs 哈希不一致。
 5. **缺少 SPC_STATEMENT_TYPE 属性**：signtool 在 authenticatedAttributes 中包含 `SpcStatementType` (OID 1.3.6.1.4.1.311.2.1.11 = Microsoft Individual Code Signing)。
 6. **dwLength 未对齐**：WIN_CERTIFICATE 的 `dwLength` 应为 8 字节对齐后的大小。
+7. **authenticatedAttributes 排序错误**：DER SET OF 要求按编码字节排序（X.690 §11.6），未排序导致 authAttrs 哈希与 signtool 不一致。
+8. **证书顺序错误**：PKCS#7 中证书应按链顺序排列（中间 CA 在前，签名证书在后），与 signtool 一致。
+9. **messageDigest 计算错误**：RFC 5652 §5.4 规定 messageDigest 应对 eContent 的**内容字节**（不含外层 SEQUENCE tag+length）计算哈希，而非对完整 DER 计算。
 
 **修复**：
 - `pe/p7u.go`：修正 `BitString` 编码（`Bytes: nil`）和 `spcLinkFileContent`（`{0xa2, 0x02, 0x80, 0x00}`），与 signtool 输出一致
@@ -571,6 +574,9 @@ go test ./...
 - `pe/p7u.go`：`digestEncryptionAlgorithm` 改为 `rsaEncryption`，与 signtool 一致
 - `pe/p7u.go`：移除 `signingTime` 属性，新增 `SpcStatementType` 属性
 - `pe/p7u.go`：`BuildWinCertificate` 的 `dwLength` 改为 8 字节对齐后的大小
+- `pe/p7u.go`：`buildAuthAttrsContent` 对属性列表按 DER 字节排序（`sort.Slice` + `bytes.Compare`）
+- `pe/p7u.go`：`BuildSignedPKCS7` 证书顺序改为链证书在前、签名证书在后
+- `pe/p7u.go`：`buildAuthAttrsContent` 中 messageDigest 改为对 `spcSeq.Bytes`（SEQUENCE 内容字节，不含 tag+length）计算 SHA-256
 - `internal/certchain`：自动从签名证书 AIA 扩展递归下载中间 CA 证书，带 PEM 缓存（7 天 TTL）
 - `server/handler/sign_raw.go`：调用 `certchain.FetchChain` 自动获取证书链并传递给签名流程
 

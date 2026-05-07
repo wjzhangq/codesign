@@ -1,12 +1,14 @@
 package pe
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"sort"
 )
 
 // OID 定义 (Authenticode / PKCS#7 相关)
@@ -405,9 +407,9 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSign
 		return nil, err
 	}
 
-	// 3. 构造 SignedData
-	allCertDERs := [][]byte{certDER}
-	allCertDERs = append(allCertDERs, chainDERs...)
+	// 3. 构造 SignedData（证书链在前，签名证书在后，与 signtool 一致）
+	allCertDERs := append([][]byte{}, chainDERs...)
+	allCertDERs = append(allCertDERs, certDER)
 	signedData, err := buildSignedDataMultiCert(allCertDERs, indirectData, signedSignerInfo)
 	if err != nil {
 		return nil, err
@@ -471,34 +473,45 @@ func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) 
 }
 
 // buildAuthAttrsContent 构造 authenticatedAttributes 的内容部分
+// 按 DER SET OF 规则排序（X.690 §11.6）
 func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
-	// 1. ContentType = SpcIndirectDataContent
 	contentTypeAttr, err := buildAttr(oidContentType, oidSpcIndirectDataContent)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. SpcSpOpusInfo (空)
 	opusInfoAttr, err := buildOpusInfoAttr()
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. SpcStatementType = Microsoft Individual Code Signing
 	statementTypeAttr, err := buildStatementTypeAttr()
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. MessageDigest = SHA-256(indirectData DER)
-	msgDigestBytes := sha256.Sum256(indirectData)
+	// RFC 5652 §5.4: messageDigest is computed over the content octets of eContent,
+	// i.e. the value bytes of the SpcIndirectDataContent SEQUENCE (without its tag+length).
+	var spcSeq asn1.RawValue
+	if _, err2 := asn1.Unmarshal(indirectData, &spcSeq); err2 != nil {
+		return nil, fmt.Errorf("unmarshal SpcIndirectDataContent: %w", err2)
+	}
+	msgDigestBytes := sha256.Sum256(spcSeq.Bytes)
 	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: msgDigestBytes[:]})
 	if err != nil {
 		return nil, err
 	}
 
-	attrs := append(append(append(contentTypeAttr, opusInfoAttr...), statementTypeAttr...), msgDigestAttr...)
+	// DER SET OF: 按编码字节排序
+	attrList := [][]byte{contentTypeAttr, opusInfoAttr, statementTypeAttr, msgDigestAttr}
+	sort.Slice(attrList, func(i, j int) bool {
+		return bytes.Compare(attrList[i], attrList[j]) < 0
+	})
 
+	var attrs []byte
+	for _, a := range attrList {
+		attrs = append(attrs, a...)
+	}
 	return attrs, nil
 }
 
