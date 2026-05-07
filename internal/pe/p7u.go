@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
-	"time"
 )
 
 // OID 定义 (Authenticode / PKCS#7 相关)
@@ -17,11 +16,12 @@ var (
 	oidSpcIndirectDataContent = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 4}
 	oidSpcPeImageData         = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 15}
 	oidSHA256                 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
-	oidSHA256WithRSA          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}
+	oidRSAEncryption          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 	oidContentType            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
 	oidSpcSpOpusInfo          = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 12}
+	oidSpcStatementType       = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 11}
+	oidMsCodeInd              = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 21}
 	oidMessageDigest          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
-	oidSigningTime            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
 	oidRFC3161CounterSign     = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
 )
 
@@ -79,10 +79,11 @@ func BuildWinCertificate(pkcs7DER []byte) []byte {
 	totalLen := 8 + len(pkcs7DER)
 	// 按 8 字节对齐
 	padLen := (8 - totalLen%8) % 8
-	buf := make([]byte, totalLen+padLen)
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(totalLen))
-	binary.LittleEndian.PutUint16(buf[4:6], 0x0200) // wRevision = WIN_CERT_REVISION_2_0
-	binary.LittleEndian.PutUint16(buf[6:8], 0x0002) // wCertificateType = WIN_CERT_TYPE_PKCS_SIGNED_DATA
+	alignedLen := totalLen + padLen
+	buf := make([]byte, alignedLen)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(alignedLen)) // dwLength (含对齐填充)
+	binary.LittleEndian.PutUint16(buf[4:6], 0x0200)            // wRevision = WIN_CERT_REVISION_2_0
+	binary.LittleEndian.PutUint16(buf[6:8], 0x0002)            // wCertificateType = WIN_CERT_TYPE_PKCS_SIGNED_DATA
 	copy(buf[8:], pkcs7DER)
 	return buf
 }
@@ -183,7 +184,7 @@ func buildSpcIndirectDataContent(digest []byte) ([]byte, error) {
 
 func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
 	// 复用 buildAuthAttrsContent 构造 authenticated attributes
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, time.Time{})
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +206,7 @@ func buildSignerInfo(cert *x509.Certificate, indirectData []byte) ([]byte, error
 			Bytes:      authAttrsBytes,
 		},
 		DigestEncAlgorithm: algorithmIdentifier{
-			Algorithm:  oidSHA256WithRSA,
+			Algorithm:  oidRSAEncryption,
 			Parameters: asn1.RawValue{Tag: asn1.TagNull},
 		},
 		EncryptedDigest: []byte{}, // 空签名值 — 由 signtool /ds 填充
@@ -385,9 +386,8 @@ func buildAttr(oid asn1.ObjectIdentifier, value interface{}) ([]byte, error) {
 //   - certDER:      签名证书 DER 编码
 //   - chainDERs:    证书链 DER 编码列表（中间 CA 等，可为 nil）
 //   - rsaSignature: RSA-PKCS1v15-SHA256 签名值 (big-endian)
-//   - signingTime:  签名时间
 //   - tsToken:      RFC 3161 时间戳令牌 (可为 nil)
-func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
+func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSignature []byte, tsToken []byte) ([]byte, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("parse cert: %w", err)
@@ -400,7 +400,7 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSign
 	}
 
 	// 2. 构造 SignerInfo（包含签名值）
-	signedSignerInfo, err := buildSignedSignerInfo(cert, indirectData, rsaSignature, signingTime, tsToken)
+	signedSignerInfo, err := buildSignedSignerInfo(cert, indirectData, rsaSignature, tsToken)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ func BuildSignedPKCS7(digest []byte, certDER []byte, chainDERs [][]byte, rsaSign
 //
 // PKCS#7 规范要求: 签名时 authenticatedAttributes 使用 SET OF (tag 0x31) 编码,
 // 而非 SignerInfo 中的 IMPLICIT [0] (tag 0xA0)
-func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte, signingTime time.Time) (string, error) {
+func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte) (string, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return "", fmt.Errorf("parse cert: %w", err)
@@ -448,7 +448,7 @@ func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte, signingTime time
 	}
 
 	// 构造 authAttrs 内容
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, signingTime)
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
 	if err != nil {
 		return "", err
 	}
@@ -471,8 +471,7 @@ func AuthAttrsDigest(authenticodeDigest []byte, certDER []byte, signingTime time
 }
 
 // buildAuthAttrsContent 构造 authenticatedAttributes 的内容部分
-// signingTime 非零时会追加 signingTime attribute（raw 模式使用）
-func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte, signingTime time.Time) ([]byte, error) {
+func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte) ([]byte, error) {
 	// 1. ContentType = SpcIndirectDataContent
 	contentTypeAttr, err := buildAttr(oidContentType, oidSpcIndirectDataContent)
 	if err != nil {
@@ -485,30 +484,27 @@ func buildAuthAttrsContent(cert *x509.Certificate, indirectData []byte, signingT
 		return nil, err
 	}
 
-	// 3. MessageDigest = SHA-256(indirectData DER)
+	// 3. SpcStatementType = Microsoft Individual Code Signing
+	statementTypeAttr, err := buildStatementTypeAttr()
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. MessageDigest = SHA-256(indirectData DER)
 	msgDigestBytes := sha256.Sum256(indirectData)
 	msgDigestAttr, err := buildAttr(oidMessageDigest, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: msgDigestBytes[:]})
 	if err != nil {
 		return nil, err
 	}
 
-	attrs := append(append(contentTypeAttr, opusInfoAttr...), msgDigestAttr...)
-
-	// 4. SigningTime（仅 raw 模式）
-	if !signingTime.IsZero() {
-		signingTimeAttr, err := buildAttr(oidSigningTime, signingTime.UTC())
-		if err != nil {
-			return nil, err
-		}
-		attrs = append(attrs, signingTimeAttr...)
-	}
+	attrs := append(append(append(contentTypeAttr, opusInfoAttr...), statementTypeAttr...), msgDigestAttr...)
 
 	return attrs, nil
 }
 
 // buildSignedSignerInfo 构造包含签名值的 SignerInfo
-func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSignature []byte, signingTime time.Time, tsToken []byte) ([]byte, error) {
-	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData, signingTime)
+func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSignature []byte, tsToken []byte) ([]byte, error) {
+	authAttrsBytes, err := buildAuthAttrsContent(cert, indirectData)
 	if err != nil {
 		return nil, err
 	}
@@ -530,7 +526,7 @@ func buildSignedSignerInfo(cert *x509.Certificate, indirectData []byte, rsaSigna
 			Bytes:      authAttrsBytes,
 		},
 		DigestEncAlgorithm: algorithmIdentifier{
-			Algorithm:  oidSHA256WithRSA,
+			Algorithm:  oidRSAEncryption,
 			Parameters: asn1.RawValue{Tag: asn1.TagNull},
 		},
 		EncryptedDigest: rsaSignature, // 已签名的值
@@ -575,6 +571,44 @@ func buildOpusInfoAttr() ([]byte, error) {
 		return nil, err
 	}
 	oidDER, err := asn1.Marshal(oidSpcSpOpusInfo)
+	if err != nil {
+		return nil, err
+	}
+	attrSeq := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      append(oidDER, valSetDER...),
+	}
+	return asn1.Marshal(attrSeq)
+}
+
+func buildStatementTypeAttr() ([]byte, error) {
+	// SpcStatementType = { oidMsCodeInd }
+	oidValDER, err := asn1.Marshal(oidMsCodeInd)
+	if err != nil {
+		return nil, err
+	}
+	seqDER, err := asn1.Marshal(asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      oidValDER,
+	})
+	if err != nil {
+		return nil, err
+	}
+	valSet := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSet,
+		IsCompound: true,
+		Bytes:      seqDER,
+	}
+	valSetDER, err := asn1.Marshal(valSet)
+	if err != nil {
+		return nil, err
+	}
+	oidDER, err := asn1.Marshal(oidSpcStatementType)
 	if err != nil {
 		return nil, err
 	}

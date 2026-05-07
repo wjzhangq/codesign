@@ -18,6 +18,7 @@ func main() {
 			cli.SignCommand(),
 			cli.ConfigCommand(),
 			cli.InfoCommand(),
+			cli.ExtractCommand(),
 			cli.XmlSignCommand(),
 			cli.XmlVerifyCommand(),
 			cli.RawSignCommand(),

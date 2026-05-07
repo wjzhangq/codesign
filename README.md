@@ -324,6 +324,19 @@ codesign raw-sign --digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 # Signature: <base64>
 ```
 
+**提取 PKCS#7 签名**（从已签名 PE 文件导出 .p7b）
+
+```bash
+# 提取签名
+codesign extract app.exe                # → app.exe.p7b
+codesign extract -o sig.p7b app.exe     # 指定输出文件名
+codesign extract a.exe b.exe c.exe      # 批量提取
+
+# 用 openssl 验证/查看提取的签名
+openssl pkcs7 -in app.exe.p7b -inform DER -print_certs -noout   # 查看证书链
+openssl asn1parse -in app.exe.p7b -inform DER                    # 查看 ASN.1 结构
+```
+
 ## API 参考
 
 所有签名接口需携带 `Authorization: Bearer <token>` 头。
@@ -543,14 +556,21 @@ go test ./...
 
 **现象**：使用 Raw 模式（`--mode raw`）签名后，Windows 属性中可以看到时间戳，但提示"主题中没有签名"。`Get-AuthenticodeSignature` 返回 `Status: NotSigned`。
 
-**根因**（两个问题叠加）：
+**根因**（多个问题叠加）：
 
 1. **SpcPeImageData 编码不一致**：`BIT_STRING` 多了一个零字节（`03 02 00 00` → 应为 `03 01 00`），`SpcString` 多了两个零字节（`80 02 00 00` → 应为 `80 00`），与 signtool 生成的编码不一致。
 2. **缺少证书链**：PKCS#7 中只包含签名证书，缺少中间 CA 证书，Windows 无法构建完整的证书信任链。
+3. **digestEncryptionAlgorithm 错误**：使用了 `sha256WithRSAEncryption` (1.2.840.113549.1.1.11)，signtool 使用 `rsaEncryption` (1.2.840.113549.1.1.1)。
+4. **多余的 signingTime 属性**：authenticatedAttributes 中包含了 `signingTime`，signtool 不在主签名中包含此属性（仅在时间戳反签名中），导致 authAttrs 哈希不一致。
+5. **缺少 SPC_STATEMENT_TYPE 属性**：signtool 在 authenticatedAttributes 中包含 `SpcStatementType` (OID 1.3.6.1.4.1.311.2.1.11 = Microsoft Individual Code Signing)。
+6. **dwLength 未对齐**：WIN_CERTIFICATE 的 `dwLength` 应为 8 字节对齐后的大小。
 
 **修复**：
 - `pe/p7u.go`：修正 `BitString` 编码（`Bytes: nil`）和 `spcLinkFileContent`（`{0xa2, 0x02, 0x80, 0x00}`），与 signtool 输出一致
 - `pe/p7u.go`：`BuildSignedPKCS7` 新增 `chainDERs` 参数，支持在 PKCS#7 中嵌入多个证书
+- `pe/p7u.go`：`digestEncryptionAlgorithm` 改为 `rsaEncryption`，与 signtool 一致
+- `pe/p7u.go`：移除 `signingTime` 属性，新增 `SpcStatementType` 属性
+- `pe/p7u.go`：`BuildWinCertificate` 的 `dwLength` 改为 8 字节对齐后的大小
 - `internal/certchain`：自动从签名证书 AIA 扩展递归下载中间 CA 证书，带 PEM 缓存（7 天 TTL）
 - `server/handler/sign_raw.go`：调用 `certchain.FetchChain` 自动获取证书链并传递给签名流程
 

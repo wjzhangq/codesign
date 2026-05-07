@@ -410,7 +410,7 @@ func TestBuildSignedPKCS7_ASN1Structure(t *testing.T) {
 	fakeDigest := make([]byte, 32)
 	fakeRSASig := make([]byte, 256)
 
-	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, nil, fakeRSASig, time.Now(), nil)
+	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, nil, fakeRSASig, nil)
 	if err != nil {
 		t.Fatalf("BuildSignedPKCS7: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestBuildSignedPKCS7_WithTimestamp(t *testing.T) {
 		Bytes: []byte{0x02, 0x01, 0x00}, // INTEGER 0
 	})
 
-	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, nil, fakeRSASig, time.Now(), fakeTsToken)
+	pkcs7DER, err := BuildSignedPKCS7(fakeDigest, certDER, nil, fakeRSASig, fakeTsToken)
 	if err != nil {
 		t.Fatalf("BuildSignedPKCS7 with timestamp: %v", err)
 	}
