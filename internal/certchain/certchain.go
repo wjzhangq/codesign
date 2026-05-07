@@ -79,12 +79,12 @@ func fetchFromAIA(certDER []byte) [][]byte {
 			break
 		}
 
-		// 不包含根 CA（自签名证书）
+		// 不包含根 CA（自签名证书：Issuer == Subject）
 		issuerCert, err := x509.ParseCertificate(issuerDER)
 		if err != nil {
 			break
 		}
-		if issuerCert.IsCA && issuerCert.CheckSignatureFrom(issuerCert) == nil {
+		if issuerCert.IsCA && issuerCert.Issuer.CommonName == issuerCert.Subject.CommonName {
 			break
 		}
 

@@ -23,10 +23,11 @@
 
 | 步骤 | 执行方 | 内容 |
 |------|--------|------|
-| Exclusive C14N + SHA-256 (Reference Digest) | 客户端 | 计算 XML 内容摘要 |
+| Inclusive C14N + SHA-256 (Reference Digest) | 客户端 | 计算 XML 内容摘要 |
 | 构造 SignedInfo + C14N + SHA-256 | 客户端 | 计算待签名摘要 |
 | RSA 签名 | 服务端 (raw-sign.exe + eToken) | 接收 64 字节 hex digest，返回 base64 签名 |
-| 组装 `<ds:Signature>` 嵌入文档 | 客户端 | 生成符合 W3C XMLDSIG 规范的签名 XML |
+| 组装 `<Signature>` 嵌入文档 | 客户端 | 生成符合 W3C XMLDSIG 规范的签名 XML |
+| 获取证书链 | 客户端 | 自动从 AIA 扩展下载中间 CA 证书（带缓存） |
 
 网络传输：64 字节 hex digest（上行）+ base64 RSA 签名（下行），原始文档不离开客户端。
 
@@ -70,14 +71,16 @@ PE 解析 → Authenticode Digest 计算
 ```
 客户端 (Go CLI, 跨平台)                    服务端 (Go, Windows + eToken)
 ──────────────────────                    ─────────────────────────────
-解析 XML → Exclusive C14N → SHA-256
+解析 XML → Inclusive C14N → SHA-256
 → 构造 SignedInfo → C14N → SHA-256
+  GET /api/cert-chain               ────► 返回证书链 (自动从 AIA 下载)
   POST /api/raw-sign                ────► JWT 验证
   { digest: "<64-char hex>",              raw-sign.exe --cspkey ... --digest ...
     algorithm: "sha256" }                 eToken CSP RSA 签名
   ~200 bytes                        ◄──── { signature: "<base64>" }
-← 组装 <ds:Signature> 嵌入 XML 文档
-  (XMLDSIG Enveloped, W3C 规范)
+← 组装 <Signature> 嵌入 XML 文档
+  (XMLDSIG Enveloped, Inclusive C14N, W3C 规范)
+  含 KeyInfo (RSAKeyValue + X509Data) + Object (issuerCertificate)
 ```
 
 ## 仓库结构
@@ -99,9 +102,12 @@ codesign/
 │   │   └── pe_test.go
 │   ├── xmldsig/                   # XMLDSIG 签名模块 (客户端)
 │   │   ├── sign.go                # SignXML 核心函数
-│   │   ├── c14n.go                # Exclusive C14N 封装
+│   │   ├── verify.go              # VerifyXML 验签函数
+│   │   ├── c14n.go                # Inclusive/Exclusive C14N 封装
 │   │   ├── elements.go            # XML 元素构造辅助函数
 │   │   └── sign_test.go
+│   ├── certchain/                 # 证书链自动获取模块
+│   │   └── certchain.go           # AIA 递归下载 + PEM 缓存
 │   ├── server/
 │   │   ├── config/config.go       # INI 配置解析
 │   │   ├── handler/               # HTTP handlers
@@ -110,7 +116,8 @@ codesign/
 │   │   │   ├── health.go          # GET /api/health
 │   │   │   ├── sign_digest.go     # POST /api/sign
 │   │   │   ├── sign_full.go       # POST /api/sign/full
-│   │   │   └── cert.go            # GET /api/cert
+│   │   │   ├── cert.go            # GET /api/cert
+│   │   │   └── cert_chain.go      # GET /api/cert-chain
 │   │   ├── middleware/jwt.go      # JWT 验证中间件
 │   │   ├── signer/                # signtool + raw-sign 封装
 │   │   │   ├── signer.go          # eToken 互斥锁
@@ -144,7 +151,6 @@ codesign/
 | SafeNet 驱动 | SafeNet Authentication Client 10.x |
 | eToken | 已插入 USB，已初始化，已导入代码签名证书 |
 | 证书文件 | `.cer` 格式 DER 编码公钥证书 |
-| 证书链 | 中间 CA 证书（Raw 模式必需，见下方说明） |
 
 > **提示**: 如果只使用 Raw 模式签名 PE 文件 + XML 签名，可以不安装 signtool / Windows SDK，只需部署 `raw-sign.exe`。
 
@@ -198,43 +204,15 @@ digest_mode   = false    # 首次部署先设为 false，验证后再改为 true
 
 > **安全提示**: `config.ini` 含 eToken 密码，文件权限应设为仅 owner 可读。
 
-**1.1 配置证书链（Raw 模式必需）**
+**1.1 证书链（自动获取）**
 
-Raw 模式由服务端自行构造 PKCS#7，需要将中间 CA 证书嵌入签名中，否则 Windows 无法验证证书链。
+证书链（中间 CA 证书）由服务端自动从签名证书的 AIA (Authority Information Access) 扩展中递归下载，无需手动配置。
 
-**获取中间 CA 证书**
+- 自动排除根 CA（自签名证书不嵌入）
+- 下载结果缓存为 PEM 文件，存放在 `temp_dir` 目录，7 天过期自动刷新
+- PE Raw 模式签名和 XML 签名均使用此机制
 
-以 DigiCert 为例，从官方证书仓库下载：
-
-1. 打开 https://www.digicert.com/kb/digicert-root-certificates.htm
-2. 搜索签名证书的 Issuer 名称（例如 `DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1`）
-3. 下载对应的 `.crt` 或 `.cer` 文件（DER 格式）
-4. 如需交叉签名根证书（`DigiCert Trusted Root G4`），一并下载
-
-也可以从已有的正确签名文件中导出：右键 → 属性 → 数字签名 → 详细信息 → 查看证书 → 证书路径 → 逐级选中中间 CA → 查看证书 → 详细信息 → 复制到文件。
-
-**配置方式（二选一，可同时使用）**
-
-方式 A — 内嵌到 INI（推荐，单文件部署）：
-
-```ini
-# 多个证书用分号分隔，每个是完整的 base64 DER 编码（无换行）
-cert_chain = MIIGsDCC...中间CA的base64...;MIIFjTCC...根CA的base64...
-```
-
-将 `.cer` 文件转为 base64：`certutil -encode ca.cer /dev/stdout | findstr /v CERTIFICATE` 或 PowerShell：
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("ca.cer"))
-```
-
-方式 B — 目录方式：
-
-```ini
-cert_chain_dir = C:\certs\chain
-```
-
-将 `.cer` / `.crt` / `.pem` / `.der` 文件放入该目录，服务端启动时自动加载。
+如果网络环境无法访问 CA 的 AIA URL（如 `http://cacerts.digicert.com/...`），需确保服务端可访问外网或配置代理。
 
 **2. 验证 Digest 模式可用性**
 
@@ -374,10 +352,25 @@ codesign raw-sign --digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 | `pe-raw` | `raw_sign_path` 已配置时存在，支持 Raw 模式 PE 签名 |
 | `raw-sign` | `raw_sign_path` 已配置时存在 |
 | `xmldsig` | 同上（`raw-sign` 是 XMLDSIG 的前提）|
+| `cert-chain` | 同上，支持自动获取证书链 |
 
 ### GET /api/cert
 
 返回 DER 编码的公钥证书（`application/x-x509-ca-cert`），用于客户端构造 `.p7u`。
+
+### GET /api/cert-chain
+
+返回证书链（中间 CA 证书），自动从签名证书的 AIA 扩展递归下载并缓存。
+
+响应 200：
+
+```json
+{
+  "chain": ["<base64 DER of intermediate CA 1>", "<base64 DER of intermediate CA 2>"]
+}
+```
+
+不包含根 CA（自签名证书）。如果无法获取证书链，返回空数组。
 
 ### POST /api/sign — Digest 模式
 
@@ -558,8 +551,8 @@ go test ./...
 **修复**：
 - `pe/p7u.go`：修正 `BitString` 编码（`Bytes: nil`）和 `spcLinkFileContent`（`{0xa2, 0x02, 0x80, 0x00}`），与 signtool 输出一致
 - `pe/p7u.go`：`BuildSignedPKCS7` 新增 `chainDERs` 参数，支持在 PKCS#7 中嵌入多个证书
-- `server/config`：新增 `cert_chain`（INI 内嵌 base64）和 `cert_chain_dir`（目录加载）两种证书链配置方式
-- `server/handler/sign_raw.go`：加载证书链并传递给签名流程
+- `internal/certchain`：自动从签名证书 AIA 扩展递归下载中间 CA 证书，带 PEM 缓存（7 天 TTL）
+- `server/handler/sign_raw.go`：调用 `certchain.FetchChain` 自动获取证书链并传递给签名流程
 
 ## 安全设计
 
@@ -579,7 +572,7 @@ go test ./...
 | `github.com/klauspost/compress/zstd` | Full 模式 zstd 压缩/解压 |
 | `github.com/urfave/cli/v2` | 客户端 CLI 框架 |
 | `github.com/beevik/etree` | XML 树解析/构造（XMLDSIG 客户端） |
-| `github.com/russellhaering/goxmldsig` | Exclusive C14N 序列化（XMLDSIG 客户端） |
+| `github.com/russellhaering/goxmldsig` | Inclusive/Exclusive C14N 序列化（XMLDSIG） |
 | 标准库 | HTTP、crypto、PE 解析、日志 (slog) |
 
 外部工具依赖：

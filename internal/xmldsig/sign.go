@@ -77,6 +77,9 @@ func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(
 	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER, chainDERs)
 	root.AddChild(sigElem)
 
+	doc.WriteSettings = etree.WriteSettings{
+		CanonicalText: true,
+	}
 	output, err := doc.WriteToBytes()
 	if err != nil {
 		return nil, fmt.Errorf("write XML: %w", err)
