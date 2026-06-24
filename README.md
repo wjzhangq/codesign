@@ -295,6 +295,8 @@ codesign xmlsign document.xml
 
 # 签名并输出到指定文件
 codesign xmlsign document.xml -o signed.xml
+codesign xmlsign document.xml --output signed.xml
+codesign xmlsign document.xml -o=signed.xml
 
 # 批量签名到目录
 codesign xmlsign *.xml -o signed/

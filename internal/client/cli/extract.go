@@ -18,23 +18,26 @@ func ExtractCommand() *cli.Command {
 		ArgsUsage: "<file> [file...]",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:    "output",
-				Aliases: []string{"o"},
-				Usage:   "Output file path (only for single file input)",
+				Name:      "output",
+				Aliases:   []string{"o"},
+				Usage:     "Output file path (only for single file input)",
+				TakesFile: false,
 			},
 		},
 		Action: func(c *cli.Context) error {
-			if c.NArg() == 0 {
+			// 手动解析 -o flag（urfave/cli 在位置参数后跟 flag 时解析有问题）
+			rawArgs := parseArgsAfterCommand()
+			output, remainingArgs := extractOutputFlag(rawArgs)
+
+			if len(remainingArgs) == 0 {
 				return cli.ShowCommandHelp(c, "extract")
 			}
 
-			output := c.String("output")
-			if output != "" && c.NArg() > 1 {
+			if output != "" && len(remainingArgs) > 1 {
 				return fmt.Errorf("-o flag can only be used with a single input file")
 			}
 
-			for i := 0; i < c.NArg(); i++ {
-				filePath := c.Args().Get(i)
+			for _, filePath := range remainingArgs {
 				outPath := output
 				if outPath == "" {
 					outPath = filePath + ".p7b"

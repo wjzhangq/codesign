@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"codesign/internal/client/api"
@@ -72,6 +73,52 @@ func xmlVerifyFile(filePath string) bool {
 	return true
 }
 
+// parseArgsAfterCommand 从 os.Args 中解析出命令名之后的所有参数
+// urfave/cli 对 "cmd file -o out" 这种格式的解析有问题，需要手动处理
+func parseArgsAfterCommand() []string {
+	for i, arg := range os.Args {
+		if arg == "extract" || arg == "xmlsign" || arg == "xmlverify" || arg == "sign" || arg == "rawsign" {
+			return os.Args[i+1:]
+		}
+	}
+	return os.Args[1:]
+}
+
+// extractOutputFlag 从参数列表中提取 -o/--output flag，返回 (outputPath, remainingArgs)
+// 简化逻辑：只有当 -o 后面紧跟另一个 flag（以 - 开头）时才跳过
+func extractOutputFlag(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		// 处理 -o value 和 --output value 格式
+		if (arg == "-o" || arg == "--output") && i+1 < len(args) {
+			value := args[i+1]
+			// 只有当 value 以 - 开头时，才认为它是另一个 flag
+			if !strings.HasPrefix(value, "-") {
+				remaining := make([]string, 0, len(args)-2)
+				remaining = append(remaining, args[:i]...)
+				remaining = append(remaining, args[i+2:]...)
+				return value, remaining
+			}
+		}
+		// 处理 -o=value 或 --output=value 格式
+		if strings.HasPrefix(arg, "-o=") {
+			value := strings.TrimPrefix(arg, "-o=")
+			remaining := make([]string, 0, len(args)-1)
+			remaining = append(remaining, args[:i]...)
+			remaining = append(remaining, args[i+1:]...)
+			return value, remaining
+		}
+		if strings.HasPrefix(arg, "--output=") {
+			value := strings.TrimPrefix(arg, "--output=")
+			remaining := make([]string, 0, len(args)-1)
+			remaining = append(remaining, args[:i]...)
+			remaining = append(remaining, args[i+1:]...)
+			return value, remaining
+		}
+	}
+	return "", args
+}
+
 // XmlSignCommand 返回 xmlsign 命令定义
 func XmlSignCommand() *urfavecli.Command {
 	return &urfavecli.Command{
@@ -80,9 +127,10 @@ func XmlSignCommand() *urfavecli.Command {
 		ArgsUsage: "<file> [file...]",
 		Flags: []urfavecli.Flag{
 			&urfavecli.StringFlag{
-				Name:    "output",
-				Aliases: []string{"o"},
-				Usage:   "Output file path (default: overwrite input)",
+				Name:      "output",
+				Aliases:   []string{"o"},
+				Usage:     "Output file path (default: overwrite input)",
+				TakesFile: false,
 			},
 			&urfavecli.StringFlag{
 				Name:  "server",
@@ -94,7 +142,11 @@ func XmlSignCommand() *urfavecli.Command {
 			},
 		},
 		Action: func(c *urfavecli.Context) error {
-			if c.NArg() == 0 {
+			// 手动解析 -o flag（urfave/cli 在位置参数后跟 flag 时解析有问题）
+			rawArgs := parseArgsAfterCommand()
+			outputPath, remainingArgs := extractOutputFlag(rawArgs)
+
+			if len(remainingArgs) == 0 {
 				return urfavecli.ShowCommandHelp(c, "xmlsign")
 			}
 
@@ -110,8 +162,7 @@ func XmlSignCommand() *urfavecli.Command {
 			}
 
 			client := api.New(cfg.Server, cfg.Token)
-			outputPath := c.String("output")
-			files := c.Args().Slice()
+			files := remainingArgs
 
 			// 多文件 + 指定单个输出文件 → 错误
 			if len(files) > 1 && outputPath != "" {
