@@ -17,7 +17,7 @@ import (
 //   - chainDERs: 证书链 DER 编码列表（中间 CA 等，可为 nil）
 //   - signFunc:  远程签名回调，接收 hex digest，返回 base64 签名值
 //
-// 返回签名后的完整 XML 文档字节
+// 返回签名后的完整 XML 文档字节（C14N 规范化格式）
 func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(digestHex string) (string, error)) ([]byte, error) {
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(xmlBytes); err != nil {
@@ -71,18 +71,16 @@ func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(
 	}
 
 	// ═══════════════════════════════════════
-	// Step 4: 组装 Signature，嵌入文档
+	// Step 4: 组装 Signature，嵌入文档，输出 C14N 格式
 	// ═══════════════════════════════════════
 
 	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER, chainDERs)
 	root.AddChild(sigElem)
 
-	doc.WriteSettings = etree.WriteSettings{
-		CanonicalText: true,
-	}
-	output, err := doc.WriteToBytes()
+	// 输出整个文档的 C14N 格式
+	output, err := inclusiveC14N(root)
 	if err != nil {
-		return nil, fmt.Errorf("write XML: %w", err)
+		return nil, fmt.Errorf("c14n output: %w", err)
 	}
 	return output, nil
 }
