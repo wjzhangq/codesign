@@ -1,10 +1,14 @@
 package xmldsig
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"time"
+
+	"codesign/internal/pe"
 
 	"github.com/beevik/etree"
 )
@@ -16,9 +20,10 @@ import (
 //   - certDER:   公钥证书 DER 编码
 //   - chainDERs: 证书链 DER 编码列表（中间 CA 等，可为 nil）
 //   - signFunc:  远程签名回调，接收 hex digest，返回 base64 签名值
+//   - tsaURL:    时间戳服务器 URL（空字符串表示不使用时间戳）
 //
 // 返回签名后的完整 XML 文档字节（C14N 规范化格式）
-func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(digestHex string) (string, error)) ([]byte, error) {
+func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(digestHex string) (string, error), tsaURL string) ([]byte, error) {
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(xmlBytes); err != nil {
 		return nil, fmt.Errorf("parse XML: %w", err)
@@ -71,10 +76,34 @@ func SignXML(xmlBytes []byte, certDER []byte, chainDERs [][]byte, signFunc func(
 	}
 
 	// ═══════════════════════════════════════
+	// Step 3.5: 请求时间戳（如果指定了 TSA URL）
+	// ═══════════════════════════════════════
+
+	var timestampToken []byte
+	var signingTime time.Time
+
+	if tsaURL != "" {
+		signingTime = time.Now()
+
+		// 解码 base64 签名以获取原始字节（TSA 需要对签名值进行哈希）
+		signatureBytes, err := base64.StdEncoding.DecodeString(signatureB64)
+		if err != nil {
+			return nil, fmt.Errorf("decode signature for timestamp: %w", err)
+		}
+
+		// 使用现有的时间戳基础设施请求 RFC 3161 时间戳
+		ctx := context.Background()
+		timestampToken, err = pe.RequestTimestamp(ctx, signatureBytes, tsaURL)
+		if err != nil {
+			return nil, fmt.Errorf("request timestamp: %w", err)
+		}
+	}
+
+	// ═══════════════════════════════════════
 	// Step 4: 组装 Signature，嵌入文档，输出 C14N 格式
 	// ═══════════════════════════════════════
 
-	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER, chainDERs)
+	sigElem := buildSignatureElement(signedInfoElem, signatureB64, certDER, chainDERs, timestampToken, signingTime, tsaURL != "")
 	root.AddChild(sigElem)
 
 	// 输出整个文档的 C14N 格式

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/beevik/etree"
 )
@@ -49,7 +50,7 @@ func buildSignedInfo(digestValue string) *etree.Element {
 }
 
 // buildSignatureElement 组装完整的 <Signature>（无命名空间前缀）
-func buildSignatureElement(signedInfo *etree.Element, signatureB64 string, certDER []byte, chainDERs [][]byte) *etree.Element {
+func buildSignatureElement(signedInfo *etree.Element, signatureB64 string, certDER []byte, chainDERs [][]byte, timestampToken []byte, signingTime time.Time, hasTimestamp bool) *etree.Element {
 	sig := etree.NewElement("Signature")
 	sig.CreateAttr("xmlns", DSigNS)
 
@@ -69,6 +70,11 @@ func buildSignatureElement(signedInfo *etree.Element, signatureB64 string, certD
 	// <Object> with issuer certificate chain
 	if len(chainDERs) > 0 {
 		buildObject(sig, chainDERs)
+	}
+
+	// <Object> with timestamp if available
+	if len(timestampToken) > 0 {
+		buildTimestampObject(sig, timestampToken, signingTime, hasTimestamp)
 	}
 
 	return sig
@@ -126,6 +132,16 @@ func buildObject(sig *etree.Element, chainDERs [][]byte) {
 		issuerCert := sigProp.CreateElement("issuerCertificate")
 		issuerCert.SetText(base64.StdEncoding.EncodeToString(der))
 	}
+}
+
+// buildTimestampObject 构造 <Object><UnsignedProperties> 包含 RFC 3161 时间戳
+func buildTimestampObject(sig *etree.Element, timestampToken []byte, signingTime time.Time, hasTimestamp bool) {
+	obj := sig.CreateElement("Object")
+	unsignedProps := obj.CreateElement("UnsignedProperties")
+
+	// <EncapsulatedTimeStamp>base64(timestamp token)</EncapsulatedTimeStamp>
+	encapTS := unsignedProps.CreateElement("EncapsulatedTimeStamp")
+	encapTS.SetText(base64.StdEncoding.EncodeToString(timestampToken))
 }
 
 // formatX509Name 格式化 X.509 DN 为 .NET 风格

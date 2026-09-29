@@ -28,8 +28,13 @@
 | RSA 签名 | 服务端 (raw-sign.exe + eToken) | 接收 64 字节 hex digest，返回 base64 签名 |
 | 组装 `<Signature>` 嵌入文档 | 客户端 | 生成符合 W3C XMLDSIG 规范的签名 XML |
 | 获取证书链 | 客户端 | 自动从 AIA 扩展下载中间 CA 证书（带缓存） |
+| RFC 3161 时间戳（可选） | 客户端 | 使用 `-t/--timestamp` 参数时，向 TSA 服务器请求时间戳令牌 |
 
 网络传输：64 字节 hex digest（上行）+ base64 RSA 签名（下行），原始文档不离开客户端。
+
+时间戳结构：签名包含两个 `<Object>` 元素：
+- 第一个 `<Object>` 包含 issuer 证书链（`<SignatureProperties>` → `<issuerCertificate>`）
+- 第二个 `<Object>` 包含 RFC 3161 时间戳（`<UnsignedProperties>` → `<EncapsulatedTimeStamp>`）
 
 ## 架构
 
@@ -78,9 +83,13 @@ PE 解析 → Authenticode Digest 计算
   { digest: "<64-char hex>",              raw-sign.exe --cspkey ... --digest ...
     algorithm: "sha256" }                 eToken CSP RSA 签名
   ~200 bytes                        ◄──── { signature: "<base64>" }
+  (可选) RFC 3161 时间戳请求
+  → TSA URL                         ────► 请求时间戳令牌
 ← 组装 <Signature> 嵌入 XML 文档
   (XMLDSIG Enveloped, Inclusive C14N, W3C 规范)
-  含 KeyInfo (RSAKeyValue + X509Data) + Object (issuerCertificate)
+  含 KeyInfo (RSAKeyValue + X509Data) + 
+      Object (issuerCertificate) +
+      Object (UnsignedProperties / EncapsulatedTimeStamp)
 ```
 
 ## 仓库结构
@@ -99,9 +108,10 @@ codesign/
 │   │   ├── extract.go             # 从已签名 PE 提取 cert table
 │   │   ├── p7u.go                 # 构造 unsigned PKCS#7
 │   │   ├── stub.go                # 构造最小 stub PE (供 signtool /di)
+│   │   ├── timestamp.go           # RFC 3161 时间戳请求
 │   │   └── pe_test.go
 │   ├── xmldsig/                   # XMLDSIG 签名模块 (客户端)
-│   │   ├── sign.go                # SignXML 核心函数
+│   │   ├── sign.go                # SignXML 核心函数（支持时间戳）
 │   │   ├── verify.go              # VerifyXML 验签函数
 │   │   ├── c14n.go                # Inclusive/Exclusive C14N 封装
 │   │   ├── elements.go            # XML 元素构造辅助函数
@@ -128,7 +138,7 @@ codesign/
 │   │   ├── token/manager.go       # JWT 签发 / 撤销 / 持久化
 │   │   └── preflight/check.go    # 启动前置检查
 │   └── client/
-│       ├── cli/                   # sign / xmlsign / raw-sign / config / info 命令
+│       ├── cli/                   # sign / xmlsign / xmlverify / raw-sign / config / info 命令
 │       ├── api/client.go          # HTTP 客户端
 │       └── config/config.go       # ~/.codesign/config.json
 ├── testdata/
@@ -301,11 +311,21 @@ codesign xmlsign document.xml -o=signed.xml
 # 批量签名到目录
 codesign xmlsign *.xml -o signed/
 
+# 添加 RFC 3161 时间戳
+codesign xmlsign document.xml -t http://timestamp.digicert.com
+codesign xmlsign document.xml --timestamp http://timestamp.digicert.com
+
+# 使用 xmlsign-ts 命令签名（带时间戳）
+codesign xmlsign-ts input.xml output.xml --tsa-url http://timestamp.digicert.com
+codesign xmlsign-ts input.xml output.xml -t http://timestamp.digicert.com
+codesign xmlsign-ts input.xml output.xml -t http://timestamp.digicert.com --digest sha256
+codesign xmlsign-ts input.xml output.xml -t http://timestamp.digicert.com --id ElementID
+
 # 覆盖服务器配置
 codesign xmlsign --server http://localhost:8443 --token xxx document.xml
 ```
 
-签名过程输出示例：
+签名过程输出示例（无时间戳）：
 
 ```
   document.xml
@@ -318,12 +338,48 @@ codesign xmlsign --server http://localhost:8443 --token xxx document.xml
   Done in 1.3s
 ```
 
+签名过程输出示例（带时间戳）：
+
+```
+  document.xml
+  [1/4] Computing document digest...
+        input: 312 bytes
+  [2/4] Remote signing...
+        remote: 1.2s
+  [3/4] Requesting timestamp...
+        TSA: http://timestamp.digicert.com
+        remote: 0.8s
+  [4/4] Writing output...
+        output: document.xml (2456 bytes)
+  Done in 2.1s
+```
+
 **raw-sign 调试命令**（直接对任意 digest 签名，仅供调试）
 
 ```bash
 codesign raw-sign --digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 --algo sha256
 # Algorithm: sha256
 # Signature: <base64>
+```
+
+**XML 签名验证**（验证 XMLDSIG 签名的有效性）
+
+```bash
+# 验证单个文件
+codesign xmlverify document.xml
+
+# 批量验证
+codesign xmlverify *.xml
+```
+
+验证输出示例：
+
+```
+  document.xml
+  VALID
+  Signer  : Lenovo
+  Issuer  : DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1
+  Valid   : 2026-08-26 00:00:00 +0000 UTC → 2027-09-23 23:59:59 +0000 UTC
 ```
 
 **提取 PKCS#7 签名**（从已签名 PE 文件导出 .p7b）

@@ -77,7 +77,7 @@ func xmlVerifyFile(filePath string) bool {
 // urfave/cli 对 "cmd file -o out" 这种格式的解析有问题，需要手动处理
 func parseArgsAfterCommand() []string {
 	for i, arg := range os.Args {
-		if arg == "extract" || arg == "xmlsign" || arg == "xmlverify" || arg == "sign" || arg == "rawsign" {
+		if arg == "extract" || arg == "xmlsign" || arg == "xmlsign-ts" || arg == "xmlverify" || arg == "sign" || arg == "rawsign" {
 			return os.Args[i+1:]
 		}
 	}
@@ -119,6 +119,40 @@ func extractOutputFlag(args []string) (string, []string) {
 	return "", args
 }
 
+// extractTimestampFlag 从参数列表中提取 -t/--timestamp flag，返回 (tsaURL, remainingArgs)
+func extractTimestampFlag(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		// 处理 -t value 和 --timestamp value 格式
+		if (arg == "-t" || arg == "--timestamp") && i+1 < len(args) {
+			value := args[i+1]
+			// 只有当 value 以 - 开头时，才认为它是另一个 flag
+			if !strings.HasPrefix(value, "-") {
+				remaining := make([]string, 0, len(args)-2)
+				remaining = append(remaining, args[:i]...)
+				remaining = append(remaining, args[i+2:]...)
+				return value, remaining
+			}
+		}
+		// 处理 -t=value 或 --timestamp=value 格式
+		if strings.HasPrefix(arg, "-t=") {
+			value := strings.TrimPrefix(arg, "-t=")
+			remaining := make([]string, 0, len(args)-1)
+			remaining = append(remaining, args[:i]...)
+			remaining = append(remaining, args[i+1:]...)
+			return value, remaining
+		}
+		if strings.HasPrefix(arg, "--timestamp=") {
+			value := strings.TrimPrefix(arg, "--timestamp=")
+			remaining := make([]string, 0, len(args)-1)
+			remaining = append(remaining, args[:i]...)
+			remaining = append(remaining, args[i+1:]...)
+			return value, remaining
+		}
+	}
+	return "", args
+}
+
 // XmlSignCommand 返回 xmlsign 命令定义
 func XmlSignCommand() *urfavecli.Command {
 	return &urfavecli.Command{
@@ -133,6 +167,11 @@ func XmlSignCommand() *urfavecli.Command {
 				TakesFile: false,
 			},
 			&urfavecli.StringFlag{
+				Name:    "timestamp",
+				Aliases: []string{"t"},
+				Usage:   "Timestamp server URL (RFC 3161 TSA)",
+			},
+			&urfavecli.StringFlag{
 				Name:  "server",
 				Usage: "Override server URL",
 			},
@@ -142,9 +181,10 @@ func XmlSignCommand() *urfavecli.Command {
 			},
 		},
 		Action: func(c *urfavecli.Context) error {
-			// 手动解析 -o flag（urfave/cli 在位置参数后跟 flag 时解析有问题）
+			// 手动解析 -o 和 -t flags（urfave/cli 在位置参数后跟 flag 时解析有问题）
 			rawArgs := parseArgsAfterCommand()
 			outputPath, remainingArgs := extractOutputFlag(rawArgs)
+			tsaURL, remainingArgs := extractTimestampFlag(remainingArgs)
 
 			if len(remainingArgs) == 0 {
 				return urfavecli.ShowCommandHelp(c, "xmlsign")
@@ -184,7 +224,7 @@ func XmlSignCommand() *urfavecli.Command {
 			hasError := false
 			for _, filePath := range files {
 				outPath := resolveOutputPath(filePath, outputPath)
-				if err := xmlSignFile(client, filePath, outPath, certDER, chainDERs); err != nil {
+				if err := xmlSignFile(client, filePath, outPath, certDER, chainDERs, tsaURL); err != nil {
 					if len(files) > 1 {
 						fmt.Fprintf(os.Stderr, "  ERROR %s: %v\n", filePath, err)
 						hasError = true
@@ -213,7 +253,7 @@ func resolveOutputPath(inputPath, outputPath string) string {
 	return outputPath
 }
 
-func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byte, chainDERs [][]byte) error {
+func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byte, chainDERs [][]byte, tsaURL string) error {
 	start := time.Now()
 
 	fmt.Printf("\n  %s\n", filepath.Base(inputPath))
@@ -223,12 +263,20 @@ func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byt
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}
-	fmt.Printf("  [1/3] Computing document digest...\n")
+
+	stepNum := 1
+	totalSteps := 3
+	if tsaURL != "" {
+		totalSteps = 4
+	}
+
+	fmt.Printf("  [%d/%d] Computing document digest...\n", stepNum, totalSteps)
 	fmt.Printf("        input: %d bytes\n", len(xmlBytes))
+	stepNum++
 
 	// 签名回调: 通过 API 调用服务端 raw-sign
 	signFunc := func(digestHex string) (string, error) {
-		fmt.Printf("  [2/3] Remote signing...\n")
+		fmt.Printf("  [%d/%d] Remote signing...\n", stepNum, totalSteps)
 		remoteStart := time.Now()
 		resp, err := client.RawSign(digestHex, "sha256")
 		if err != nil {
@@ -239,13 +287,13 @@ func xmlSignFile(client *api.Client, inputPath, outputPath string, certDER []byt
 	}
 
 	// 执行 XMLDSIG 签名
-	signedXML, err := xmldsig.SignXML(xmlBytes, certDER, chainDERs, signFunc)
+	signedXML, err := xmldsig.SignXML(xmlBytes, certDER, chainDERs, signFunc, tsaURL)
 	if err != nil {
 		return fmt.Errorf("xmldsig sign: %w", err)
 	}
 
 	// 写入输出（先写临时文件再 rename，保证原子性）
-	fmt.Printf("  [3/3] Writing output...\n")
+	fmt.Printf("  [%d/%d] Writing output...\n", totalSteps, totalSteps)
 	tmpPath := outputPath + ".tmp"
 	if err := os.WriteFile(tmpPath, signedXML, 0644); err != nil {
 		return fmt.Errorf("write temp output: %w", err)
