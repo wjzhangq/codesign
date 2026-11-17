@@ -14,8 +14,8 @@ import (
 	"codesign/internal/pe"
 )
 
-// maxDecompressedSize 限制解压后文件大小（防 zip bomb）：400 MB
-const maxDecompressedSize = 400 * 1024 * 1024
+// maxDecompressedSize 限制解压后文件大小（防 zip bomb）：6 GB
+const maxDecompressedSize = 6 * 1024 * 1024 * 1024
 
 // ErrChecksumMismatch 表示文件 SHA-256 校验失败（传输损坏）
 var ErrChecksumMismatch = fmt.Errorf("checksum mismatch")

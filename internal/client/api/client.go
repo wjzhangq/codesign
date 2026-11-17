@@ -398,33 +398,29 @@ func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 	}
 	tmpFile.Close()
 
-	// 3. 打开压缩后的临时文件用于上传
-	compressedFile, err := os.Open(tmpPath)
-	if err != nil {
-		return nil, fmt.Errorf("open compressed file: %w", err)
-	}
-	defer compressedFile.Close()
-
 	// 动态超时: 基础 60s + 每 10MB 增加 10s（基于原始文件大小）
 	timeoutSecs := 60 + int(fileSize/(10*1024*1024))*10
 	filename := filepath.Base(filePath)
 
-	// 4. 带重试的上传
+	// 3. 带重试的上传（每次重试重新打开压缩文件，避免文件句柄被 HTTP client 关闭）
 	var lastErr error
 	for attempt := 0; attempt <= signFullMaxRetries; attempt++ {
 		if attempt > 0 {
 			fmt.Printf("        retry %d/%d...\n", attempt, signFullMaxRetries)
 			time.Sleep(time.Duration(attempt) * time.Second) // 递增退避
-			// seek 回压缩文件开头
-			if _, err := compressedFile.Seek(0, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("seek compressed file: %w", err)
-			}
+		}
+
+		// 每次尝试都重新打开压缩文件（HTTP client 会关闭 request body）
+		compressedFile, err := os.Open(tmpPath)
+		if err != nil {
+			return nil, fmt.Errorf("open compressed file: %w", err)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
 
 		req, err := http.NewRequestWithContext(ctx, "POST", c.server+"/api/sign/full", compressedFile)
 		if err != nil {
+			compressedFile.Close()
 			cancel()
 			return nil, err
 		}
@@ -435,6 +431,7 @@ func (c *Client) SignFull(filePath string) (*SignResponse, error) {
 		req.Header.Set("X-Content-SHA256", fileHash)
 
 		resp, err := c.httpClient.Do(req)
+		compressedFile.Close() // 显式关闭文件（HTTP client 可能已经关闭，但再次关闭是安全的）
 		if err != nil {
 			cancel()
 			lastErr = fmt.Errorf("sign full: %w", err)
